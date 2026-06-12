@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-信用卡新聞分類工具 v16
+信用卡新聞分類工具 v17
 兩檔上傳版 + 爬蟲正文抽取模式：
 1. Mastercard raw data
 2. 信用卡分類設定與聲量總表.xlsx（含：信用卡清單_總聲量、關鍵字判定表、月份工作表）
@@ -22,6 +22,10 @@ import re
 import unicodedata
 import warnings
 import hashlib
+import html as html_lib
+import os
+import pickle
+import time
 
 import pandas as pd
 import requests
@@ -37,7 +41,7 @@ try:
 except Exception:
     pass
 
-APP_VERSION = "v16_2_site_extraction_rule_fix"
+APP_VERSION = "v17.5.3｜Step導覽＋精簡下載區版"
 
 MONTH_NAMES = [
     "January", "February", "March", "April", "May", "June",
@@ -54,6 +58,23 @@ RESULT_COLUMNS = [
 PENDING_COLUMNS = RESULT_COLUMNS + ["待確認原因"]
 FAILED_COLUMNS = ["原始列號", "監測日期", "訊息標題", "Mastercard URL", "SourceWeb URL", "錯誤原因"]
 NO_CARD_COLUMNS = ["原始列號", "監測日期", "訊息標題", "Mastercard URL", "SourceWeb URL", "處理狀態", "判定原因"]
+PAPER_SOURCE_LABEL = "報紙（監測報告無 SourceWeb）"
+PAPER_REVIEW_REASON = "報紙截圖 / 監測報告無 SourceWeb，需人工審核"
+TEMP_STATE_SHEET = "工作臺狀態"
+TEMP_STATE_COLUMNS = MONTH_COLUMNS + ["判定依據", "待確認原因", "錯誤原因", "判定原因", "移入原因"]
+
+SESSION_DIR = ".credit_card_classifier_sessions"
+SESSION_FILE = os.path.join(SESSION_DIR, "latest_progress.pkl")
+PROGRESS_KEYS = [
+    "classified", "no_card_rows", "pending_rows", "failed_rows",
+    "processed_orders", "no_card_orders", "pending_orders", "failed_orders",
+    "last_detected", "last_pending", "last_fetch", "selected_order", "last_message",
+    "manual_queue_rows", "manual_orders", "manual_active_order", "manual_staged_cards",
+    "title_result_cache", "reuse_logs",
+    "raw_sig", "setting_sig", "raw_bytes", "setting_bytes",
+    "news_df", "card_master", "keyword_df", "org_rules", "generic_terms",
+    "missing_rules_df", "orphan_rules_df",
+]
 
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -113,6 +134,16 @@ def get_domain(url: str) -> str:
 
 def is_http_url(url: str) -> bool:
     return as_text(url).lower().startswith(("http://", "https://"))
+
+
+def markdown_link(label: str, url: str) -> str:
+    """把 URL 轉成 Streamlit markdown 可點擊連結；非網址則保留文字。"""
+    u = as_text(url)
+    safe_label = html_lib.escape(as_text(label) or "開啟連結")
+    if is_http_url(u):
+        safe_url = html_lib.escape(u, quote=True)
+        return f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer">{safe_label}</a>'
+    return html_lib.escape(u or "無")
 
 
 def likely_mastercard_report_url(url: str) -> bool:
@@ -343,7 +374,7 @@ def reset_working_state(reason: str = ""):
         "classified", "no_card_rows", "pending_rows", "failed_rows",
         "processed_orders", "no_card_orders", "pending_orders", "failed_orders",
         "last_detected", "last_pending", "last_fetch", "manual_queue_rows",
-        "manual_orders", "manual_active_order", "title_result_cache", "reuse_logs",
+        "manual_orders", "manual_active_order", "manual_staged_cards", "title_result_cache", "reuse_logs",
         "temp_workbook_bytes", "final_workbook_bytes", "download_status_message",
     ]:
         if key in st.session_state:
@@ -351,6 +382,279 @@ def reset_working_state(reason: str = ""):
     init_state()
     if reason:
         st.session_state.last_message = reason
+
+
+def _ensure_session_dir():
+    try:
+        os.makedirs(SESSION_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def save_progress_to_disk(reason: str = "auto") -> bool:
+    """把目前工作臺進度存到本機/部署環境的暫存檔，降低重刷後遺失風險。"""
+    try:
+        if not isinstance(st.session_state.get("news_df"), pd.DataFrame) or st.session_state.news_df.empty:
+            return False
+        _ensure_session_dir()
+        payload = {"saved_at": time.time(), "reason": reason, "app_version": APP_VERSION, "data": {}}
+        for key in PROGRESS_KEYS:
+            if key in st.session_state:
+                payload["data"][key] = st.session_state[key]
+        with open(SESSION_FILE, "wb") as f:
+            pickle.dump(payload, f)
+        st.session_state["last_autosave_at"] = payload["saved_at"]
+        return True
+    except Exception as exc:
+        st.session_state["last_autosave_error"] = str(exc)
+        return False
+
+
+def load_saved_progress() -> dict | None:
+    try:
+        if not os.path.exists(SESSION_FILE):
+            return None
+        with open(SESSION_FILE, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def restore_progress_to_state(payload: dict) -> bool:
+    try:
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        for key, value in data.items():
+            st.session_state[key] = value
+        st.session_state["progress_restored"] = True
+        st.session_state["last_autosave_at"] = payload.get("saved_at", None)
+        return True
+    except Exception as exc:
+        st.session_state["last_autosave_error"] = str(exc)
+        return False
+
+
+def clear_saved_progress_file() -> bool:
+    try:
+        if os.path.exists(SESSION_FILE):
+            os.remove(SESSION_FILE)
+        return True
+    except Exception:
+        return False
+
+
+def saved_progress_label(payload: dict | None) -> str:
+    if not payload:
+        return "目前沒有可恢復的上次進度。"
+    saved_at = payload.get("saved_at")
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(saved_at)) if saved_at else "未知時間"
+    except Exception:
+        ts = "未知時間"
+    data = payload.get("data", {})
+    classified_count = len(data.get("classified", [])) if data.get("classified") is not None else 0
+    pending_count = len(data.get("pending_rows", [])) if data.get("pending_rows") is not None else 0
+    no_card_count = len(data.get("no_card_rows", [])) if data.get("no_card_rows") is not None else 0
+    return f"上次自動保存：{ts}｜已分類 {classified_count}｜待確認 {pending_count}｜無卡排除 {no_card_count}"
+
+
+def _ensure_df_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """補齊 DataFrame 欄位，避免由暫存 Excel 恢復時缺欄造成後續表格錯誤。"""
+    if df is None or not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame()
+    out = df.copy()
+    for col in columns:
+        if col not in out.columns:
+            out[col] = ""
+    return out[columns].copy()
+
+
+def _row_has_value(row: dict) -> bool:
+    return any(as_text(v) for v in row.values())
+
+
+def _read_table_sheet(wb, sheet_name: str) -> list[dict]:
+    """讀取第一列為表頭的工作表。"""
+    if sheet_name not in wb.sheetnames:
+        return []
+    ws = wb[sheet_name]
+    headers = [as_text(ws.cell(1, c).value) for c in range(1, ws.max_column + 1)]
+    rows = []
+    for r in range(2, ws.max_row + 1):
+        item = {}
+        for c, h in enumerate(headers, start=1):
+            if h:
+                item[h] = ws.cell(r, c).value
+        if _row_has_value(item):
+            rows.append(item)
+    return rows
+
+
+def read_temp_workbook_progress(workbook_bytes: bytes) -> dict:
+    """讀取「暫存月度結果表」，重建工作臺狀態。
+
+    支援新版含「工作臺狀態」分頁，也支援舊版只含 January-December 月份明細的暫存表。
+    """
+    wb = load_workbook(BytesIO(workbook_bytes), data_only=True)
+    rows = _read_table_sheet(wb, TEMP_STATE_SHEET)
+    if not rows:
+        # 兼容舊版暫存表：直接從月份明細表恢復。
+        for sheet in MONTH_NAMES:
+            rows.extend(_read_table_sheet(wb, sheet))
+    if not rows:
+        raise ValueError("暫存結果表中找不到可恢復的月份明細或工作臺狀態。")
+
+    # 補齊欄位，並排除沒有原始列號的列。
+    clean_rows = []
+    for raw in rows:
+        item = {c: raw.get(c, "") for c in TEMP_STATE_COLUMNS}
+        try:
+            item["原始列號"] = int(float(as_text(item.get("原始列號", ""))))
+        except Exception:
+            continue
+        item["處理狀態"] = as_text(item.get("處理狀態", "")) or "未處理"
+        clean_rows.append(item)
+    if not clean_rows:
+        raise ValueError("暫存結果表沒有可辨識的原始列號。")
+
+    # 由所有狀態列重建 raw data 索引。
+    base_map: dict[int, dict] = {}
+    for r in clean_rows:
+        order = int(r["原始列號"])
+        if order not in base_map:
+            base_map[order] = {
+                "原始列號": order,
+                "監測日期": r.get("監測日期", ""),
+                "訊息標題": r.get("訊息標題", ""),
+                "Mastercard URL": r.get("Mastercard URL", ""),
+            }
+        else:
+            # 若第一筆缺資料，用後續列補上。
+            for k in ["監測日期", "訊息標題", "Mastercard URL"]:
+                if not as_text(base_map[order].get(k, "")) and as_text(r.get(k, "")):
+                    base_map[order][k] = r.get(k, "")
+    news_df = pd.DataFrame([base_map[k] for k in sorted(base_map)])
+
+    classified, no_card_rows, pending_rows, failed_rows, manual_queue_rows = [], [], [], [], []
+    for r in clean_rows:
+        status = normalize_text(r.get("處理狀態", ""))
+        if status == normalize_text("已分類") and as_text(r.get("銀行別", "")) and as_text(r.get("提及信用卡", "")):
+            classified.append({
+                "原始列號": r.get("原始列號", ""),
+                "監測日期": r.get("監測日期", ""),
+                "訊息標題": r.get("訊息標題", ""),
+                "Mastercard URL": r.get("Mastercard URL", ""),
+                "SourceWeb URL": r.get("SourceWeb URL", ""),
+                "銀行別": r.get("銀行別", ""),
+                "提及信用卡": r.get("提及信用卡", ""),
+                "卡組織": r.get("卡組織", ""),
+                "處理狀態": "已分類",
+                "判定依據": r.get("判定依據", "") or "由暫存月度結果表恢復",
+            })
+        elif status == normalize_text("無卡排除"):
+            no_card_rows.append({
+                "原始列號": r.get("原始列號", ""),
+                "監測日期": r.get("監測日期", ""),
+                "訊息標題": r.get("訊息標題", ""),
+                "Mastercard URL": r.get("Mastercard URL", ""),
+                "SourceWeb URL": r.get("SourceWeb URL", ""),
+                "處理狀態": "無卡排除",
+                "判定原因": r.get("判定原因", "") or "由暫存月度結果表恢復",
+            })
+        elif status == normalize_text("待確認"):
+            pending_rows.append({
+                "原始列號": r.get("原始列號", ""),
+                "監測日期": r.get("監測日期", ""),
+                "訊息標題": r.get("訊息標題", ""),
+                "Mastercard URL": r.get("Mastercard URL", ""),
+                "SourceWeb URL": r.get("SourceWeb URL", ""),
+                "銀行別": r.get("銀行別", ""),
+                "提及信用卡": r.get("提及信用卡", ""),
+                "卡組織": r.get("卡組織", ""),
+                "處理狀態": "待確認",
+                "判定依據": r.get("判定依據", "") or "由暫存月度結果表恢復",
+                "待確認原因": r.get("待確認原因", "") or "由暫存月度結果表恢復",
+            })
+        elif status == normalize_text("抓取失敗") or "失敗" in status:
+            failed_rows.append({
+                "原始列號": r.get("原始列號", ""),
+                "監測日期": r.get("監測日期", ""),
+                "訊息標題": r.get("訊息標題", ""),
+                "Mastercard URL": r.get("Mastercard URL", ""),
+                "SourceWeb URL": r.get("SourceWeb URL", ""),
+                "錯誤原因": r.get("錯誤原因", "") or "由暫存月度結果表恢復",
+            })
+        elif status == normalize_text("手動補卡"):
+            manual_queue_rows.append({
+                "原始列號": r.get("原始列號", ""),
+                "監測日期": r.get("監測日期", ""),
+                "訊息標題": r.get("訊息標題", ""),
+                "Mastercard URL": r.get("Mastercard URL", ""),
+                "SourceWeb URL": r.get("SourceWeb URL", ""),
+                "移入原因": r.get("移入原因", "") or "由暫存月度結果表恢復",
+                "全文": "",
+                "內文標註": "",
+            })
+        # 未處理只需要留在 news_df，不加入任何工作臺集合。
+
+    classified_df = _ensure_df_columns(pd.DataFrame(classified), RESULT_COLUMNS)
+    return {
+        "news_df": news_df,
+        "classified": classified_df,
+        "no_card_rows": no_card_rows,
+        "pending_rows": pending_rows,
+        "failed_rows": failed_rows,
+        "manual_queue_rows": manual_queue_rows,
+    }
+
+
+def rebuild_title_result_cache_from_state():
+    """從已恢復的已分類 / 無卡排除結果重建同標題快取。"""
+    st.session_state.title_result_cache = {}
+    if not isinstance(st.session_state.get("news_df"), pd.DataFrame) or st.session_state.news_df.empty:
+        return
+    for _, row in st.session_state.news_df.iterrows():
+        try:
+            order = int(row.get("原始列號"))
+        except Exception:
+            continue
+        key = reusable_title_key(row.get("訊息標題", ""))
+        if not key or key in st.session_state.title_result_cache:
+            continue
+        classified = []
+        if isinstance(st.session_state.get("classified"), pd.DataFrame) and len(st.session_state.classified):
+            classified = st.session_state.classified[st.session_state.classified["原始列號"].astype(str) == str(order)].to_dict("records")
+        no_cards = [r for r in st.session_state.get("no_card_rows", []) if str(r.get("原始列號", "")) == str(order)]
+        if classified:
+            st.session_state.title_result_cache[key] = {"source_order": order, "type": "已分類", "classified": classified, "no_card": None}
+        elif no_cards:
+            st.session_state.title_result_cache[key] = {"source_order": order, "type": "無卡排除", "classified": [], "no_card": no_cards[0]}
+
+
+def restore_temp_workbook_progress_to_state(progress: dict):
+    """將暫存月度結果表的狀態寫回 session_state，讓後續可繼續偵測與人工審核。"""
+    st.session_state.news_df = progress.get("news_df", pd.DataFrame())
+    st.session_state.classified = _ensure_df_columns(progress.get("classified", pd.DataFrame()), RESULT_COLUMNS)
+    st.session_state.no_card_rows = progress.get("no_card_rows", []) or []
+    st.session_state.pending_rows = progress.get("pending_rows", []) or []
+    st.session_state.failed_rows = progress.get("failed_rows", []) or []
+    st.session_state.manual_queue_rows = progress.get("manual_queue_rows", []) or []
+
+    st.session_state.processed_orders = set(st.session_state.classified["原始列號"].astype(int).tolist()) if len(st.session_state.classified) else set()
+    st.session_state.no_card_orders = set(int(r.get("原始列號")) for r in st.session_state.no_card_rows if as_text(r.get("原始列號", "")))
+    st.session_state.pending_orders = set(int(r.get("原始列號")) for r in st.session_state.pending_rows if as_text(r.get("原始列號", "")))
+    st.session_state.failed_orders = set(int(r.get("原始列號")) for r in st.session_state.failed_rows if as_text(r.get("原始列號", "")))
+    st.session_state.manual_orders = set(int(r.get("原始列號")) for r in st.session_state.manual_queue_rows if as_text(r.get("原始列號", "")))
+
+    st.session_state.last_detected = pd.DataFrame()
+    st.session_state.last_pending = pd.DataFrame()
+    st.session_state.last_fetch = {}
+    st.session_state.selected_order = int(st.session_state.news_df.iloc[0]["原始列號"]) if len(st.session_state.news_df) else None
+    st.session_state.manual_active_order = next(iter(sorted(st.session_state.manual_orders)), None) if st.session_state.manual_orders else None
+    st.session_state.manual_staged_cards = {}
+    st.session_state.reuse_logs = []
+    rebuild_title_result_cache_from_state()
+    sort_state_tables()
+    invalidate_downloads()
 
 
 # -----------------------------------------------------------------------------
@@ -693,6 +997,16 @@ def extract_text_from_html(html: str, url: str = "") -> str:
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
 
+
+def is_paper_source_missing_error(error: str | None) -> bool:
+    """監測報告沒有 SourceWeb 時，視為報紙截圖，必須進待確認。"""
+    e = as_text(error)
+    return "監測報告無 SourceWeb" in e or "報紙截圖" in e
+
+
+def is_paper_source_label(source_url: str) -> bool:
+    return "報紙" in as_text(source_url) and "SourceWeb" in as_text(source_url)
+
 def resolve_source_and_text(input_url: str, title: str) -> tuple[str, str, str | None]:
     """回傳 source_url, article_text, error。
 
@@ -700,11 +1014,13 @@ def resolve_source_and_text(input_url: str, title: str) -> tuple[str, str, str |
     1. 若是 Mastercard 監測頁，先解析 SourceWeb。
     2. 優先抓 SourceWeb 原始新聞正文。
     3. 若 SourceWeb 抓取失敗或正文過短，使用 Mastercard 監測頁文字作 fallback。
-    4. 後續偵測會使用「標題 + 正文 / fallback 文字」。
+    4. 若 Mastercard 監測頁找不到 SourceWeb，判定為報紙截圖 / 掃描版，不自動無卡或已分類，後續強制進待確認。
     """
     input_url = as_text(input_url)
     if not input_url:
-        return "", "", "沒有網址"
+        note = f"【系統標註】{PAPER_REVIEW_REASON}；此列未提供可解析網址。"
+        return PAPER_SOURCE_LABEL, note, PAPER_REVIEW_REASON
+
     source_url = input_url
     html, error = fetch_html(input_url)
     if error:
@@ -724,9 +1040,56 @@ def resolve_source_and_text(input_url: str, title: str) -> tuple[str, str, str |
                 combined = f"{source_text}\n\n--- Mastercard fallback ---\n{report_text}".strip()
                 return source_url, combined, None
             return source_url, source_text, None
-        return input_url, report_text, None
+
+        # 監測報告沒有 SourceWeb：通常代表報紙截圖 / 掃描版，不能自動無卡排除或自動分類。
+        note = f"【系統標註】{PAPER_REVIEW_REASON}。此筆不進抓取失敗，也不進無卡排除；請人工開啟 Mastercard 監測報告檢查圖片或掃描內容。"
+        article_text = f"{note}\n\n--- Mastercard 監測報告文字 ---\n{report_text}".strip()
+        return PAPER_SOURCE_LABEL, article_text, PAPER_REVIEW_REASON
 
     return source_url, extract_text_from_html(html, source_url), None
+
+
+def inspect_monitoring_record_without_sourceweb(input_url: str, title: str = "") -> tuple[bool, str]:
+    """檢查監測紀錄是否沒有 SourceWeb。
+
+    回傳：
+    - True：監測報告沒有 SourceWeb，視為報紙截圖 / 掃描版
+    - False：不是監測報告、或監測報告有 SourceWeb、或暫時無法判斷
+
+    注意：若同標題已有「有 SourceWeb 的網路新聞」完成分類，報紙截圖可套用其卡片結果；
+    若沒有可套用結果，仍必須進待確認。
+    """
+    input_url = as_text(input_url)
+    if not input_url:
+        note = f"【系統標註】{PAPER_REVIEW_REASON}；此列未提供可解析網址。"
+        return True, note
+    if not likely_mastercard_report_url(input_url):
+        return False, ""
+    html, error = fetch_html(input_url)
+    if error:
+        return False, ""
+    extracted = extract_source_url_from_report_html(html)
+    if extracted:
+        return False, ""
+    report_text = extract_text_from_html(html, input_url)
+    note = (
+        f"【系統標註】{PAPER_REVIEW_REASON}。"
+        f"若同標題已有 SourceWeb 網路新聞完成分類，系統可套用其卡片分類；"
+        f"若沒有，請人工開啟 Mastercard 監測報告檢查報紙圖片或掃描內容。"
+    )
+    article_text = f"{note}\n\n--- Mastercard 監測報告文字 ---\n{report_text}".strip()
+    return True, article_text
+
+
+def cached_classified_has_valid_sourceweb(cached: dict) -> bool:
+    """判斷快取結果是否來自有 SourceWeb 的已分類新聞。"""
+    if not cached or cached.get("type") != "已分類":
+        return False
+    for r in cached.get("classified", []) or []:
+        url = as_text(r.get("SourceWeb URL", ""))
+        if url and not is_paper_source_label(url) and "報紙" not in url:
+            return True
+    return False
 
 
 # -----------------------------------------------------------------------------
@@ -1021,7 +1384,7 @@ def detect_cards_core(title: str, article_text: str, source_url: str, keyword_df
 def is_cardu_longform_text(title: str, article_text: str, source_url: str = "") -> bool:
     domain = get_domain(source_url)
     combined = f"{title}\n{as_text(article_text)[:6000]}"
-    indicators = ["推薦信用卡", "海外信用卡", "必辦", "夯卡", "懶人包", "總整理", "文章目錄", "信用卡比較"]
+    indicators = ["推薦信用卡", "海外信用卡", "必辦", "必帶信用卡", "高回饋", "夯卡", "懶人包", "總整理", "文章目錄", "信用卡比較", "哪些銀行", "有無回饋", "刷卡有無回饋"]
     return ("cardu" in domain or "卡優" in combined) and any(contains_term(combined, x) for x in indicators)
 
 
@@ -1114,6 +1477,241 @@ def extract_card_blocks(article_text: str, card_master: pd.DataFrame | None = No
 
 
 
+
+# -----------------------------------------------------------------------------
+# v16.5 CardU 多卡整理文 / 銀行清單 / 表格解析工具
+# -----------------------------------------------------------------------------
+
+BANK_ALIASES_FOR_LIST_PARSER = {
+    "國泰世華": ["國泰世華", "國泰", "國泰世華銀行"],
+    "中國信託": ["中國信託", "中信", "中國信託銀行"],
+    "台新銀行": ["台新銀行", "台新"],
+    "玉山銀行": ["玉山銀行", "玉山"],
+    "永豐銀行": ["永豐銀行", "永豐", "永豐銀"],
+    "聯邦銀行": ["聯邦銀行", "聯邦"],
+    "第一銀行": ["第一銀行", "一銀", "第一銀"],
+    "富邦銀行": ["富邦銀行", "台北富邦", "富邦", "北富銀"],
+    "兆豐銀行": ["兆豐銀行", "兆豐", "兆豐銀"],
+    "臺灣企銀": ["臺灣企銀", "台灣企銀", "台企銀", "臺企銀", "臺灣中小企銀", "台灣中小企銀"],
+    "台企銀": ["臺灣企銀", "台灣企銀", "台企銀", "臺企銀", "臺灣中小企銀", "台灣中小企銀"],
+    "陽信銀行": ["陽信銀行", "陽信"],
+    "星展銀行": ["星展銀行", "星展"],
+    "上海銀行": ["上海銀行", "上海商銀", "上海商業儲蓄銀行"],
+    "遠東商銀": ["遠東商銀", "遠東銀行", "遠銀"],
+    "新光銀行": ["新光銀行", "新光"],
+    "彰化銀行": ["彰化銀行", "彰銀", "彰化"],
+    "合作金庫": ["合作金庫", "合庫"],
+    "華南銀行": ["華南銀行", "華南"],
+    "元大銀行": ["元大銀行", "元大"],
+    "凱基銀行": ["凱基銀行", "凱基"],
+    "滙豐銀行": ["滙豐銀行", "滙豐", "匯豐", "HSBC"],
+    "美國運通": ["美國運通", "Amex", "American Express"],
+}
+
+NON_CARD_LIST_TOKENS = {
+    normalize_text(x) for x in [
+        "全卡別", "全卡", "所有卡別", "不限卡別", "不限信用卡", "其他卡別",
+        "除左側列表外全卡別", "除右側列表外全卡別", "除上述外全卡別", "除下列外全卡別",
+        "無", "不適用", "不回饋", "有回饋", "回饋", "無回饋", "一般消費", "海外消費",
+        "實體刷卡", "網路消費", "歐盟", "英國", "備註", "全銀行", "發卡機構",
+    ]
+}
+
+MULTICARD_TITLE_INDICATORS = [
+    "推薦信用卡", "信用卡推薦", "必帶信用卡", "必辦", "高回饋", "總整理", "懶人包",
+    "一次看", "信用卡權益", "權益一次看", "神卡", "哩程卡", "回饋卡", "信用卡比較",
+    "哪些銀行", "有無回饋", "刷卡有無回饋", "歐洲信用卡", "海外信用卡", "遊歐洲",
+]
+
+TABLE_OR_LIST_INDICATORS = [
+    "發卡機構", "有回饋", "無回饋", "總整理表", "回饋總整理", "刷卡有無回饋",
+    "哪些銀行", "部分卡別", "卡別", "銀行：", "銀行:", "●", "•",
+]
+
+
+def is_cardu_multicard_article(title: str, source_url: str, article_text: str = "") -> bool:
+    if not is_cardu_site(source_url, article_text):
+        return False
+    combined = f"{title}\n{as_text(article_text)[:3000]}"
+    return any(contains_term(combined, x) for x in MULTICARD_TITLE_INDICATORS)
+
+
+def get_known_bank_aliases_from_master(card_master: pd.DataFrame | None = None) -> dict[str, list[str]]:
+    aliases = dict(BANK_ALIASES_FOR_LIST_PARSER)
+    if card_master is not None and len(card_master):
+        for bank in card_master.get("銀行別", pd.Series(dtype=str)).dropna().astype(str).unique().tolist():
+            bank = as_text(bank)
+            if not bank:
+                continue
+            base = bank.replace("銀行", "").replace("商銀", "")
+            vals = aliases.setdefault(bank, [])
+            vals.extend([bank, base])
+    # de-duplicate while preserving order
+    out = {}
+    for bank, vals in aliases.items():
+        seen = set(); clean = []
+        for v in vals:
+            v = as_text(v)
+            if not v:
+                continue
+            k = normalize_text(v)
+            if k not in seen:
+                seen.add(k); clean.append(v)
+        out[bank] = clean
+    return out
+
+
+def find_bank_context(line: str, card_master: pd.DataFrame | None = None) -> str:
+    norm = normalize_text(line)
+    aliases = get_known_bank_aliases_from_master(card_master)
+    # prefer longer aliases to avoid false partial matches
+    candidates = []
+    for bank, vals in aliases.items():
+        for alias in vals:
+            an = normalize_text(alias)
+            if an and an in norm:
+                candidates.append((len(an), bank))
+    if not candidates:
+        return ""
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def is_non_card_candidate(candidate: str) -> bool:
+    c = re.sub(r"\s+", " ", as_text(candidate)).strip(" ：:，,、；;。()（）[]【】")
+    n = normalize_text(c)
+    if not n:
+        return True
+    if n in NON_CARD_LIST_TOKENS:
+        return True
+    if any(tok in n for tok in NON_CARD_LIST_TOKENS):
+        # only suppress if candidate is short enough to be mostly status text
+        if len(n) <= 18:
+            return True
+    if len(c) <= 1:
+        return True
+    if c.isdigit():
+        return True
+    deny_terms = ["登錄", "活動", "優惠", "回饋", "現折", "最高", "每月", "上限", "限量", "詳情", "備註", "說明", "官網", "連結", "申辦", "線上"]
+    if not any(x in c for x in ["卡", "card", "Card", "CUBE", "Unicard", "Richart", "DAWAY", "DAWHO", "LINE Pay", "uniopen", "MaiCoin", "Costco"]):
+        return True
+    if any(x in c for x in deny_terms) and len(c) <= 10:
+        return True
+    return False
+
+
+def inherit_card_suffix(items: list[str]) -> list[str]:
+    """Handle patterns like ANA 極緻卡/無限卡/晶緻卡 and 世界商務/鈦金商務卡."""
+    out = []
+    last_suffix = ""
+    # work backwards to inherit trailing 卡 when omitted
+    for item in reversed(items):
+        clean = as_text(item).strip(" ：:，,、；;。()（）[]【】")
+        if not clean:
+            continue
+        if "卡" in clean:
+            last_suffix = "卡"
+            out.append(clean)
+        else:
+            if last_suffix and any(x in clean for x in ["世界", "鈦金", "御璽", "晶緻", "商務", "無限", "白金", "極緻"]):
+                out.append(clean + last_suffix)
+            else:
+                out.append(clean)
+    return list(reversed(out))
+
+
+def expand_compound_card_candidates(fragment: str) -> list[str]:
+    s = as_text(fragment)
+    if not s:
+        return []
+    # normalize brackets but keep content; remove too noisy prefixes
+    s = re.sub(r"[\t\r]+", " ", s)
+    s = re.sub(r"※.*$", "", s)
+    s = re.sub(r"（[^）]{0,20}(?:每月|上限|回饋|需登錄|活動|歐盟|英國)[^）]{0,30}）", "", s)
+    s = re.sub(r"\([^)]{0,20}(?:每月|上限|回饋|需登錄|活動|歐盟|英國)[^)]{0,30}\)", "", s)
+    # split separators commonly used in CardU lists/tables
+    raw_parts = re.split(r"[、,，；;\n]+|\s{2,}|(?<!https):(?=\S)", s)
+    parts = []
+    for part in raw_parts:
+        part = as_text(part).strip()
+        if not part:
+            continue
+        sub = re.split(r"\s*/\s*|／", part)
+        expanded_sub = inherit_card_suffix(sub)
+        parts.extend(expanded_sub)
+    out = []
+    seen = set()
+    for p in parts:
+        p = re.sub(r"^(有回饋|無回饋|回饋|卡別|推薦|\d+\.?\s*)", "", as_text(p)).strip(" ：:，,、；;。()（）[]【】")
+        # remove bank prefix only if candidate is too long? Keep bank+card useful for matching.
+        if is_non_card_candidate(p):
+            continue
+        k = normalize_text(p)
+        if k not in seen:
+            seen.add(k); out.append(p)
+    return out
+
+
+def extract_bank_list_candidate_texts(text: str, card_master: pd.DataFrame | None = None) -> list[dict]:
+    """Parse lines like '●永豐銀行：A、B、C' or table-ish rows into focused candidate snippets."""
+    lines = [re.sub(r"\s+", " ", x).strip() for x in as_text(text).splitlines()]
+    lines = [x for x in lines if x and not is_cardu_noise_line(x)]
+    candidates = []
+    bank_aliases = get_known_bank_aliases_from_master(card_master)
+    bank_alias_pattern = "|".join(sorted({re.escape(v) for vals in bank_aliases.values() for v in vals if as_text(v)}, key=len, reverse=True))
+    if not bank_alias_pattern:
+        return candidates
+    for i, line in enumerate(lines):
+        if any(contains_term(line, x) for x in ["全卡別", "除左側", "除右側", "除上述", "除下列"]):
+            # still parse explicit cards on the same row, but suppress the status tokens
+            pass
+        bank = find_bank_context(line, card_master)
+        # Pattern 1: bullet/bank colon list
+        m = re.search(rf"(?:●|•|-|－)?\s*({bank_alias_pattern})\s*[:：]\s*(.+)$", line)
+        if m:
+            bank = find_bank_context(m.group(1), card_master) or bank
+            rhs = m.group(2)
+            for cand in expand_compound_card_candidates(rhs):
+                candidates.append({"bank": bank, "candidate": cand, "source_line": line, "source_type": "銀行清單"})
+            continue
+        # Pattern 2: table-like rows where bank appears with several card names
+        if bank and ("卡" in line or "CUBE" in line or "Unicard" in line or "Richart" in line):
+            # remove leading bank text and status tokens; then split remaining pieces
+            rhs = re.sub(rf".*?({bank_alias_pattern})", "", line, count=1).strip(" ：:｜|\t")
+            # Skip pure sentence paragraphs; parse only lines that look list/table-like
+            if any(sep in line for sep in ["、", "／", "/", "｜", "|", "：", ":"]) or len(line) < 80:
+                for cand in expand_compound_card_candidates(rhs):
+                    candidates.append({"bank": bank, "candidate": cand, "source_line": line, "source_type": "表格/銀行列"})
+    # de-duplicate candidates
+    out=[]; seen=set()
+    for c in candidates:
+        key=(normalize_text(c.get("bank","")), normalize_text(c.get("candidate","")))
+        if key[1] and key not in seen:
+            seen.add(key); out.append(c)
+    return out
+
+
+def detect_from_candidate_snippets(title: str, candidates: list[dict], source_url: str, keyword_df: pd.DataFrame, card_master: pd.DataFrame, org_rules: pd.DataFrame, generic_terms: set[str], basis_prefix: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    frames_det=[]; frames_pen=[]
+    for c in candidates:
+        bank = as_text(c.get("bank", ""))
+        cand = as_text(c.get("candidate", ""))
+        if not cand:
+            continue
+        # Use bank + candidate to satisfy '需銀行' helper rules without scanning unrelated page text.
+        snippet = "\n".join([x for x in [bank, cand, c.get("source_line", "")] if as_text(x)])
+        det, pen = detect_cards_core(title, snippet, source_url, keyword_df, card_master, org_rules, generic_terms, basis_prefix=f"{basis_prefix}/{c.get('source_type','清單')}：{cand}", cardu_mode=False)
+        if len(det): frames_det.append(det)
+        if len(pen): frames_pen.append(pen)
+    det_all = pd.concat(frames_det, ignore_index=True) if frames_det else pd.DataFrame()
+    pen_all = pd.concat(frames_pen, ignore_index=True) if frames_pen else pd.DataFrame()
+    return dedupe_rule_results(det_all), dedupe_rule_results(pen_all)
+
+
+def is_structured_multicard_text(title: str, article_text: str) -> bool:
+    combined = f"{title}\n{as_text(article_text)[:5000]}"
+    return any(contains_term(combined, x) for x in MULTICARD_TITLE_INDICATORS + TABLE_OR_LIST_INDICATORS)
+
 def extract_list_sections(text: str) -> list[str]:
     """擷取「指定卡別：A、B、C」這類高價值區塊，避免只靠整篇全文掃描。"""
     src = as_text(text)
@@ -1140,7 +1738,7 @@ def is_cardu_single_card_article(title: str, source_url: str, article_text: str 
     t = as_text(title)
     if not t or "》" not in t:
         return False
-    longform_indicators = ["推薦信用卡", "必辦", "夯卡", "懶人包", "總整理", "比較", "15張", "10張", "文章目錄"]
+    longform_indicators = ["推薦信用卡", "信用卡推薦", "必辦", "必帶信用卡", "高回饋", "夯卡", "懶人包", "總整理", "比較", "15張", "10張", "文章目錄", "哪些銀行", "有無回饋"]
     if any(contains_term(t, x) for x in longform_indicators):
         return False
     left = t.split("》", 1)[0]
@@ -1193,37 +1791,61 @@ def dedupe_rule_results(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 def detect_cards(title: str, article_text: str, source_url: str, keyword_df: pd.DataFrame, card_master: pd.DataFrame, org_rules: pd.DataFrame, generic_terms: set[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """信用卡偵測主入口（v16 crawler extraction mode）。
+    """信用卡偵測主入口（v16.5）。
 
-    優先順序：
-    1. 一般新聞的「指定卡別/適用信用卡」清單優先，若清單已抓到卡，避免全文短詞亂入。
-    2. CardU 單卡文：只接受標題主卡支持的結果。
-    3. CardU 多卡長文：使用 strict block mode。
-    4. 其他一般新聞：標題 + 清理後正文判斷。
+    v16.5 核心：
+    - 非正文/廣告區仍嚴格排除。
+    - CardU 單卡文只抓標題主卡。
+    - CardU 多卡整理文改用「清單/表格/銀行列」積極解析，提高召回。
+    - 一般新聞仍優先解析指定卡別清單，避免 e卡/M卡 等短詞亂入。
     """
     frames_det: list[pd.DataFrame] = []
     frames_pen: list[pd.DataFrame] = []
 
     cardu_site = is_cardu_site(source_url, article_text)
-    cardu_single = is_cardu_single_card_article(title, source_url, article_text)
+    cardu_multi = cardu_site and is_cardu_multicard_article(title, source_url, article_text)
+    cardu_single = is_cardu_single_card_article(title, source_url, article_text) and not cardu_multi
     cardu_longform = is_cardu_longform_text(title, article_text, source_url)
 
-    # 一般新聞：指定卡別清單優先。若清單成功抓到結果，直接以清單結果為主，避免 e卡/M卡 等短詞從全文亂入。
-    list_sections = [] if cardu_site else extract_list_sections(f"{title}\n{article_text}")
+    # 1) 指定卡別清單：一般新聞優先；CardU 多卡文也允許在正文內解析，因為它常包含大量正文清單。
+    list_sections = extract_list_sections(f"{title}\n{article_text}") if (not cardu_site or cardu_multi) else []
     if list_sections:
         for sec in list_sections:
             det, pen = detect_cards_core(title, sec, source_url, keyword_df, card_master, org_rules, generic_terms, basis_prefix="指定卡別清單")
-            if len(det):
-                frames_det.append(det)
-            if len(pen):
-                frames_pen.append(pen)
+            if len(det): frames_det.append(det)
+            if len(pen): frames_pen.append(pen)
+
+    # 2) CardU 多卡整理文：解析「銀行：卡片清單」、表格列、斜線/頓號複合卡名。
+    #    這比 strict block 更適合 10張推薦卡、歐洲回饋總整理、哪些銀行無回饋等文章。
+    if cardu_multi or (cardu_site and is_structured_multicard_text(title, article_text)):
+        candidates = extract_bank_list_candidate_texts(article_text, card_master)
+        det_s, pen_s = detect_from_candidate_snippets(title, candidates, source_url, keyword_df, card_master, org_rules, generic_terms, basis_prefix="CardU多卡結構解析")
+        if len(det_s): frames_det.append(det_s)
+        if len(pen_s): frames_pen.append(pen_s)
+
+        # 多卡文仍補跑有效卡片區塊標題，但不跑整頁全文，避免廣告區誤抓。
+        blocks = extract_card_blocks(article_text, card_master, keyword_df)
+        for idx, block in enumerate(blocks, start=1):
+            block_title = block.splitlines()[0][:60] if block.splitlines() else f"區塊{idx}"
+            det, pen = detect_cards_core(block_title, block, source_url, keyword_df, card_master, org_rules, generic_terms, basis_prefix=f"CardU多卡區塊{idx}：{block_title}", cardu_mode=True)
+            if len(det): frames_det.append(det)
+            if len(pen): frames_pen.append(pen)
+
+        detected = pd.concat(frames_det, ignore_index=True) if frames_det else pd.DataFrame()
+        pending = pd.concat(frames_pen, ignore_index=True) if frames_pen else pd.DataFrame()
+        if len(detected) or len(pending):
+            return dedupe_rule_results(detected), dedupe_rule_results(pending)
+        # 如果結構解析沒抓到，才走嚴格模式，不走寬鬆全文掃描。
+
+    # 3) 如果一般新聞指定清單已抓到結果，直接返回，避免全文短詞或頁面噪音亂入。
+    if list_sections and not cardu_site:
         list_det = pd.concat(frames_det, ignore_index=True) if frames_det else pd.DataFrame()
         list_pen = pd.concat(frames_pen, ignore_index=True) if frames_pen else pd.DataFrame()
         if len(list_det) or len(list_pen):
             return dedupe_rule_results(list_det), dedupe_rule_results(list_pen)
 
+    # 4) CardU 單卡文：只接受標題主卡支持的結果，防推薦/廣告卡。
     if cardu_single:
-        # 單卡文先用標題抓主卡，再用正文補充，但只保留標題能支持的同一主卡。
         det_t, pen_t = detect_cards_core(title, title, source_url, keyword_df, card_master, org_rules, generic_terms, basis_prefix="CardU單卡標題", cardu_mode=False)
         det_a, pen_a = detect_cards_core(title, article_text, source_url, keyword_df, card_master, org_rules, generic_terms, basis_prefix="CardU單卡正文", cardu_mode=False)
         det = pd.concat([det_t, det_a], ignore_index=True) if len(det_t) or len(det_a) else pd.DataFrame()
@@ -1232,22 +1854,21 @@ def detect_cards(title: str, article_text: str, source_url: str, keyword_df: pd.
         pen = filter_results_for_cardu_single(pen, title, keyword_df)
         return dedupe_rule_results(det), dedupe_rule_results(pen)
 
-    if cardu_longform:
+    # 5) CardU 長文但非多卡結構文：使用 strict block mode。
+    if cardu_site and cardu_longform:
         blocks = extract_card_blocks(article_text, card_master, keyword_df)
         if len(blocks) >= 3:
             for idx, block in enumerate(blocks, start=1):
                 block_title = block.splitlines()[0][:60] if block.splitlines() else f"區塊{idx}"
                 det, pen = detect_cards_core(block_title, block, source_url, keyword_df, card_master, org_rules, generic_terms, basis_prefix=f"CardU長文區塊{idx}：{block_title}", cardu_mode=True)
-                if len(det):
-                    frames_det.append(det)
-                if len(pen):
-                    frames_pen.append(pen)
+                if len(det): frames_det.append(det)
+                if len(pen): frames_pen.append(pen)
         else:
-            # CardU 但無法可靠切塊時，用單卡/一般嚴格路徑，避免全文亂掃。
             det, pen = detect_cards_core(title, article_text, source_url, keyword_df, card_master, org_rules, generic_terms, basis_prefix="CardU未切塊正文", cardu_mode=True)
             if len(det): frames_det.append(det)
             if len(pen): frames_pen.append(pen)
     else:
+        # 6) 其他一般新聞：清理後正文 + 標題。
         det, pen = detect_cards_core(title, article_text, source_url, keyword_df, card_master, org_rules, generic_terms)
         if len(det): frames_det.append(det)
         if len(pen): frames_pen.append(pen)
@@ -1293,6 +1914,8 @@ def init_state():
         "last_message": "",
         "manual_queue_rows": [],
         "manual_orders": set(),
+        "manual_active_order": None,
+        "manual_staged_cards": {},
         "title_result_cache": {},
         "reuse_logs": [],
         "temp_workbook_bytes": None,
@@ -1309,6 +1932,7 @@ def init_state():
         "generic_terms": set(),
         "missing_rules_df": pd.DataFrame(),
         "orphan_rules_df": pd.DataFrame(),
+        "loaded_from_temp_workbook": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1319,6 +1943,29 @@ def invalidate_downloads():
     st.session_state.temp_workbook_bytes = None
     st.session_state.final_workbook_bytes = None
     st.session_state.download_status_message = ""
+
+
+def sort_state_tables():
+    """讓工作臺結果依原始列號排序。
+    手動補卡加入已分類後，結果會回到原始列號附近，而不是堆到最下方。
+    """
+    if isinstance(st.session_state.get("classified"), pd.DataFrame) and len(st.session_state.classified):
+        st.session_state.classified = (
+            st.session_state.classified
+            .sort_values(
+                by=["原始列號", "銀行別", "提及信用卡", "卡組織"],
+                kind="mergesort",
+                na_position="last",
+            )
+            .reset_index(drop=True)
+        )
+    for list_key in ["no_card_rows", "pending_rows", "failed_rows", "manual_queue_rows"]:
+        if isinstance(st.session_state.get(list_key), list) and st.session_state[list_key]:
+            st.session_state[list_key] = sorted(
+                st.session_state[list_key],
+                key=lambda x: (int(x.get("原始列號") or 0), as_text(x.get("銀行別", "")), as_text(x.get("提及信用卡", ""))),
+            )
+
 
 
 def remove_order(order: int):
@@ -1367,6 +2014,7 @@ def add_classified_rows(order: int, base_row: dict, detected_df: pd.DataFrame, c
         })
     if new_rows:
         st.session_state.classified = pd.concat([st.session_state.classified, pd.DataFrame(new_rows)], ignore_index=True)
+        sort_state_tables()
         st.session_state.processed_orders.add(order)
         if clear_pending_order:
             st.session_state.pending_orders.discard(order)
@@ -1386,6 +2034,7 @@ def add_no_card(order: int, base_row: dict, reason: str = "人工標記無卡排
         "處理狀態": "無卡排除",
         "判定原因": reason,
     })
+    sort_state_tables()
     st.session_state.no_card_orders.add(order)
 
 
@@ -1416,6 +2065,7 @@ def add_pending(order: int, base_row: dict, pending_df: pd.DataFrame, source_url
             "判定依據": r.get("判定依據", ""),
             "待確認原因": r.get("待確認原因", ""),
         })
+    sort_state_tables()
     st.session_state.pending_orders.add(order)
 
 
@@ -1488,17 +2138,32 @@ def add_manual_queue(order: int, base_row: dict, reason: str = "", source_url: s
     invalidate_downloads()
     """把新聞移入手動補卡工作區；不直接輸出最終狀態。"""
     order = int(order)
-    exists = any(int(r.get("原始列號", -1)) == order for r in st.session_state.manual_queue_rows)
-    if not exists:
+    # 重要：若已存在，也要更新該列自己的標題/URL/全文，避免下方連結沿用上一筆 last_fetch。
+    matched = False
+    for r in st.session_state.manual_queue_rows:
+        if int(r.get("原始列號", -1)) == order:
+            r.update({
+                "監測日期": base_row.get("監測日期", r.get("監測日期", "")),
+                "訊息標題": base_row.get("訊息標題", r.get("訊息標題", "")),
+                "Mastercard URL": base_row.get("Mastercard URL", r.get("Mastercard URL", "")),
+                "SourceWeb URL": source_url or r.get("SourceWeb URL", "") or base_row.get("Mastercard URL", ""),
+                "移入原因": reason or r.get("移入原因", ""),
+                "全文": article_text or r.get("全文", ""),
+            })
+            matched = True
+            break
+    if not matched:
         st.session_state.manual_queue_rows.append({
             "原始列號": order,
             "監測日期": base_row.get("監測日期", ""),
             "訊息標題": base_row.get("訊息標題", ""),
             "Mastercard URL": base_row.get("Mastercard URL", ""),
-            "SourceWeb URL": source_url or st.session_state.last_fetch.get("source_url", base_row.get("Mastercard URL", "")),
+            "SourceWeb URL": source_url or base_row.get("Mastercard URL", ""),
             "移入原因": reason,
-            "全文": article_text or st.session_state.last_fetch.get("article_text", ""),
+            "全文": article_text or "",
+            "內文標註": "",
         })
+    sort_state_tables()
     st.session_state.manual_orders.add(order)
     st.session_state.manual_active_order = order
     st.session_state.selected_order = order
@@ -1514,6 +2179,256 @@ def remove_manual_queue_order(order: int):
     order = int(order)
     st.session_state.manual_queue_rows = [r for r in st.session_state.manual_queue_rows if int(r.get("原始列號", -1)) != order]
     st.session_state.manual_orders.discard(order)
+    st.session_state.manual_staged_cards.pop(order, None)
+
+
+def update_manual_queue_row(order: int, **updates):
+    """更新手動補卡佇列中的單一新聞，避免標題與 SourceWeb / 全文錯位。"""
+    order = int(order)
+    for r in st.session_state.manual_queue_rows:
+        if int(r.get("原始列號", -1)) == order:
+            r.update({k: v for k, v in updates.items() if v is not None})
+            return
+
+
+def hydrate_manual_article(order: int, base_row: dict, queue_row: dict) -> dict:
+    """確保手動補卡區顯示的是該列新聞自己的 SourceWeb 正文，而不是上一次偵測的全文。"""
+    order = int(order)
+    title = as_text(base_row.get("訊息標題", ""))
+    mastercard_url = as_text(base_row.get("Mastercard URL", ""))
+    existing_text = as_text(queue_row.get("全文", ""))
+    existing_source = as_text(queue_row.get("SourceWeb URL", ""))
+    if is_paper_source_label(existing_source):
+        note = as_text(queue_row.get("內文標註", "")) or f"【系統標註】{PAPER_REVIEW_REASON}。"
+        if not existing_text:
+            existing_text = note
+        update_manual_queue_row(order, **{"SourceWeb URL": PAPER_SOURCE_LABEL, "全文": existing_text, "內文標註": note})
+        return {"source_url": PAPER_SOURCE_LABEL, "article_text": existing_text, "note": note}
+    # 若已經有足夠全文，直接使用；避免每次重跑。
+    if len(existing_text) >= 120 and existing_source:
+        return {"source_url": existing_source, "article_text": existing_text, "note": as_text(queue_row.get("內文標註", ""))}
+    # 優先用 Mastercard URL 重新解析 SourceWeb，確保上方標題與下方連結一致。
+    input_url = mastercard_url or existing_source
+    if not input_url:
+        note = "【系統標註】此列沒有可用網址，請人工貼上新聞全文。"
+        update_manual_queue_row(order, **{"SourceWeb URL": existing_source, "全文": existing_text, "內文標註": note})
+        return {"source_url": existing_source, "article_text": existing_text, "note": note}
+    try:
+        source_url, article_text, error = resolve_source_and_text(input_url, title)
+    except Exception as exc:
+        source_url, article_text, error = existing_source or input_url, existing_text, str(exc)
+    article_text = as_text(article_text)
+    note = ""
+    if is_paper_source_missing_error(error) or is_paper_source_label(source_url):
+        note = f"【系統標註】{PAPER_REVIEW_REASON}。"
+    elif error and len(article_text) < 80:
+        note = f"【系統標註】SourceWeb 正文抓取不足：{error}。請開啟原始連結人工檢查。"
+    if len(article_text) < 80:
+        lower_blob = normalize_text(" ".join([title, article_text, as_text(source_url), as_text(input_url)]))
+        if any(x in lower_blob for x in ["報紙", "剪報", "圖片", "圖像", "影像", "版面"]):
+            note = "【系統標註】此筆可能為報紙圖片 / 掃描版，SourceWeb 無可解析新聞文字；請以原始連結人工檢查。"
+    update_manual_queue_row(order, **{"SourceWeb URL": source_url, "全文": article_text, "內文標註": note})
+    return {"source_url": source_url, "article_text": article_text, "note": note}
+
+
+def add_staged_manual_card(order: int, bank: str, card: str, org: str, basis: str = "人工補卡"):
+    """手動補卡先暫存；同一新聞可補多張卡，最後一次完成加入已分類。"""
+    order = int(order)
+    staged = st.session_state.manual_staged_cards.setdefault(order, [])
+    key = normalize_key(bank, card, org)
+    if not any(normalize_key(x.get("銀行別", ""), x.get("提及信用卡", ""), x.get("卡組織", "")) == key for x in staged):
+        staged.append({"銀行別": bank, "提及信用卡": card, "卡組織": org, "處理狀態": "已分類", "判定依據": basis or "人工補卡"})
+        return True
+    return False
+
+
+def stage_detected_cards_from_pasted_text(order: int, detected_df: pd.DataFrame, pending_df: pd.DataFrame | None = None) -> tuple[int, int]:
+    """把貼上全文重新偵測到的卡片先放進右側暫存卡片區，不直接完成分類。
+
+    目的：讓使用者先利用新版關鍵字表自動抓到一批候選卡，再人工補足漏掉的卡，
+    最後再按「完成補卡」。避免貼上全文後仍需全部逐張手動添加。
+    """
+    added = 0
+    skipped = 0
+    frames = []
+    if detected_df is not None and len(detected_df):
+        tmp = detected_df.copy()
+        tmp["_來源"] = "貼上全文自動偵測"
+        frames.append(tmp)
+    if pending_df is not None and len(pending_df):
+        tmp = pending_df.copy()
+        tmp["_來源"] = "貼上全文待確認候選"
+        frames.append(tmp)
+    if not frames:
+        return 0, 0
+    merged = pd.concat(frames, ignore_index=True)
+    for _, r in merged.iterrows():
+        bank = as_text(r.get("銀行別", ""))
+        card = as_text(r.get("提及信用卡", ""))
+        org = as_text(r.get("卡組織", ""))
+        if not bank or not card:
+            skipped += 1
+            continue
+        basis = as_text(r.get("判定依據", ""))
+        source_label = as_text(r.get("_來源", "貼上全文自動偵測"))
+        basis = f"{source_label}：{basis}" if basis else source_label
+        if add_staged_manual_card(int(order), bank, card, org, basis=basis):
+            added += 1
+        else:
+            skipped += 1
+    return added, skipped
+
+
+def remove_staged_manual_cards(order: int, selected_keys: list[str]):
+    order = int(order)
+    selected = set(selected_keys or [])
+    staged = st.session_state.manual_staged_cards.get(order, [])
+    st.session_state.manual_staged_cards[order] = [x for x in staged if manual_card_key(x) not in selected]
+
+
+def move_manual_item_to_no_card(order: int, base_row: dict, source_url: str = "", article_text: str = "", reason: str = "人工補卡檢查後確認無卡"):
+    """手動補卡檢查後確認沒有卡片時，移回無卡排除並清除暫存卡。"""
+    order = int(order)
+    st.session_state.last_fetch = {
+        "source_url": source_url or as_text(base_row.get("Mastercard URL", "")),
+        "article_text": as_text(article_text),
+        "error": None,
+        "字數": len(as_text(article_text)),
+    }
+    add_no_card(order, base_row, reason)
+    remove_manual_queue_order(order)
+    cache_completed_title_result(order, base_row)
+    sort_state_tables()
+
+
+def manual_card_key(row: dict) -> str:
+    return "|".join([as_text(row.get("銀行別", "")), as_text(row.get("提及信用卡", "")), as_text(row.get("卡組織", ""))])
+
+
+def classified_record_key(row: dict | pd.Series) -> str:
+    """已分類結果修正用 key：同一原始列號內，同卡片視為同一筆。"""
+    return "|".join([
+        as_text(row.get("原始列號", "")),
+        normalize_key(row.get("銀行別", ""), row.get("提及信用卡", ""), row.get("卡組織", "")),
+    ])
+
+
+def clear_title_cache_for_order(order: int, base_row: dict | None = None):
+    """移除/修正已分類結果後，清掉同標題快取，避免錯誤卡片繼續被套用。"""
+    order = int(order)
+    cache = st.session_state.get("title_result_cache", {})
+    delete_keys = []
+    for k, v in list(cache.items()):
+        try:
+            if int(v.get("source_order", -999999)) == order:
+                delete_keys.append(k)
+        except Exception:
+            continue
+    if base_row:
+        k = reusable_title_key(base_row.get("訊息標題", ""))
+        if k:
+            delete_keys.append(k)
+    for k in set(delete_keys):
+        cache.pop(k, None)
+
+
+def get_base_row_for_order(order: int) -> dict:
+    order = int(order)
+    if isinstance(st.session_state.get("news_df"), pd.DataFrame) and len(st.session_state.news_df):
+        rows = st.session_state.news_df[st.session_state.news_df["原始列號"].astype(str) == str(order)]
+        if len(rows):
+            return rows.iloc[0].to_dict()
+    for list_key in ["manual_queue_rows", "pending_rows", "failed_rows", "no_card_rows"]:
+        for r in st.session_state.get(list_key, []):
+            try:
+                if int(r.get("原始列號", -1)) == order:
+                    return dict(r)
+            except Exception:
+                continue
+    if isinstance(st.session_state.get("classified"), pd.DataFrame) and len(st.session_state.classified):
+        rows = st.session_state.classified[st.session_state.classified["原始列號"] == order]
+        if len(rows):
+            return rows.iloc[0].to_dict()
+    return {}
+
+
+def refresh_completed_title_cache_for_order(order: int):
+    """已分類結果被人工修正後，重新整理該列的同標題快取。"""
+    order = int(order)
+    base = get_base_row_for_order(order)
+    clear_title_cache_for_order(order, base)
+    if not base:
+        return
+    # 若該列仍在待確認/失敗/手動補卡，不應快取為完成結果。
+    if order in st.session_state.pending_orders or order in st.session_state.failed_orders or order in st.session_state.manual_orders:
+        return
+    classified_left = False
+    if isinstance(st.session_state.get("classified"), pd.DataFrame) and len(st.session_state.classified):
+        classified_left = len(st.session_state.classified[st.session_state.classified["原始列號"] == order]) > 0
+    no_card_left = any(int(r.get("原始列號", -1)) == order for r in st.session_state.get("no_card_rows", []))
+    if classified_left or no_card_left:
+        cache_completed_title_result(order, base)
+
+
+def remove_classified_rows_by_keys(selected_keys: list[str]) -> int:
+    """從已分類結果中移除選取卡片。用於修正系統誤抓或人工補卡取代舊卡。"""
+    selected = set(selected_keys or [])
+    if not selected or not isinstance(st.session_state.get("classified"), pd.DataFrame) or not len(st.session_state.classified):
+        return 0
+    invalidate_downloads()
+    df = st.session_state.classified.copy()
+    keys = df.apply(classified_record_key, axis=1)
+    remove_mask = keys.isin(selected)
+    affected_orders = set()
+    if remove_mask.any():
+        affected_orders = set(df.loc[remove_mask, "原始列號"].astype(int).tolist())
+    removed = int(remove_mask.sum())
+    st.session_state.classified = df.loc[~remove_mask].copy().reset_index(drop=True)
+
+    # 重新整理 processed_orders，避免已經沒有卡片的列仍被視為已分類。
+    remaining_orders = set()
+    if len(st.session_state.classified):
+        remaining_orders = set(st.session_state.classified["原始列號"].astype(int).tolist())
+    st.session_state.processed_orders = set(remaining_orders)
+
+    for order in affected_orders:
+        refresh_completed_title_cache_for_order(order)
+    sort_state_tables()
+    return removed
+
+
+def build_highlight_terms(keyword_df: pd.DataFrame, card_master: pd.DataFrame, staged_cards: list[dict] | None = None) -> list[str]:
+    terms = set()
+    for df, cols in [(keyword_df, ["主關鍵字", "提及信用卡"]), (card_master, ["提及信用卡"])]:
+        if df is None or not len(df):
+            continue
+        for col in cols:
+            if col in df.columns:
+                for v in df[col].dropna().astype(str).tolist():
+                    v = as_text(v).strip()
+                    if len(normalize_text(v)) >= 2:
+                        terms.add(v)
+    for r in staged_cards or []:
+        for col in ["提及信用卡"]:
+            v = as_text(r.get(col, "")).strip()
+            if len(normalize_text(v)) >= 2:
+                terms.add(v)
+    # 避免太多詞造成 HTML 過大；較長詞優先。
+    return sorted(terms, key=lambda x: len(x), reverse=True)[:1200]
+
+
+def highlighted_article_html(text: str, keyword_df: pd.DataFrame, card_master: pd.DataFrame, staged_cards: list[dict] | None = None, max_chars: int = 16000) -> str:
+    raw = as_text(text)[:max_chars]
+    escaped = html_lib.escape(raw)
+    for term in build_highlight_terms(keyword_df, card_master, staged_cards):
+        eterm = html_lib.escape(term)
+        if not eterm:
+            continue
+        try:
+            escaped = re.sub(re.escape(eterm), lambda m: f"<mark>{m.group(0)}</mark>", escaped, flags=re.IGNORECASE)
+        except Exception:
+            continue
+    return escaped.replace("\n", "<br>")
 
 
 def cache_completed_title_result(order: int, base_row: dict):
@@ -1529,20 +2444,249 @@ def cache_completed_title_result(order: int, base_row: dict):
     no_cards = [r for r in st.session_state.no_card_rows if int(r.get("原始列號", -1)) == order]
     if classified:
         st.session_state.title_result_cache[key] = {"source_order": order, "type": "已分類", "classified": classified, "no_card": None}
+        # 若先前同標題的報紙截圖因無 SourceWeb 被放入待確認，
+        # 一旦網路版完成分類，就可自動套用其卡片結果，不需逐筆人工補卡。
+        apply_cached_classification_to_matching_paper_pending_orders(order, base_row)
     elif no_cards:
         st.session_state.title_result_cache[key] = {"source_order": order, "type": "無卡排除", "classified": [], "no_card": no_cards[0]}
 
 
+
+
+def source_url_for_order(order: int, fallback: str = "") -> str:
+    """取得指定原始列號目前工作臺中的 SourceWeb URL，避免相同標題手動補卡時沿用錯誤連結。"""
+    order = int(order)
+    for list_key in ["manual_queue_rows", "pending_rows", "failed_rows", "no_card_rows"]:
+        for r in st.session_state.get(list_key, []):
+            try:
+                if int(r.get("原始列號", -1)) == order:
+                    url = as_text(r.get("SourceWeb URL", ""))
+                    if url:
+                        return url
+            except Exception:
+                continue
+    if isinstance(st.session_state.get("classified"), pd.DataFrame) and len(st.session_state.classified):
+        rows = st.session_state.classified[st.session_state.classified["原始列號"] == order]
+        if len(rows):
+            url = as_text(rows.iloc[0].get("SourceWeb URL", ""))
+            if url:
+                return url
+    return fallback
+
+
+def apply_cached_classification_to_matching_paper_pending_orders(source_order: int, source_base_row: dict) -> list[int]:
+    """當同標題的有 SourceWeb 網路新聞完成分類後，套用到先前待確認的報紙截圖列。
+
+    使用情境：
+    - 報紙截圖列因監測報告沒有 SourceWeb，原本必須待確認。
+    - 若同標題的網路版新聞已有 SourceWeb 並已完成分類，則報紙截圖可直接套用同一組卡片。
+    - 仍保留每一列自己的原始列號與監測日期，不做新聞去重。
+    """
+    key = reusable_title_key(source_base_row.get("訊息標題", ""))
+    if not key:
+        return []
+    cached = st.session_state.title_result_cache.get(key)
+    if not cached or cached.get("type") != "已分類" or not cached_classified_has_valid_sourceweb(cached):
+        return []
+    if not isinstance(st.session_state.get("news_df"), pd.DataFrame) or not len(st.session_state.news_df):
+        return []
+
+    source_order = int(source_order)
+    paper_orders = []
+    for r in st.session_state.get("pending_rows", []):
+        try:
+            order = int(r.get("原始列號", -1))
+        except Exception:
+            continue
+        if order == source_order or order in paper_orders:
+            continue
+        if not is_paper_source_label(as_text(r.get("SourceWeb URL", ""))):
+            continue
+        if reusable_title_key(r.get("訊息標題", "")) != key:
+            continue
+        paper_orders.append(order)
+
+    applied_orders: list[int] = []
+    for order in paper_orders:
+        raw_match = st.session_state.news_df[st.session_state.news_df["原始列號"].astype(str) == str(order)]
+        if len(raw_match):
+            base = raw_match.iloc[0].to_dict()
+        else:
+            base = next((r for r in st.session_state.pending_rows if int(r.get("原始列號", -1)) == order), {})
+        if not base:
+            continue
+
+        det = pd.DataFrame(cached.get("classified", []))
+        if det.empty:
+            continue
+        if "判定依據" in det.columns:
+            det["判定依據"] = det["判定依據"].apply(
+                lambda x: f"報紙截圖同標題套用第 {source_order} 列 SourceWeb 分類結果；{as_text(x)}"
+            )
+        else:
+            det["判定依據"] = f"報紙截圖同標題套用第 {source_order} 列 SourceWeb 分類結果"
+
+        paper_source_note = f"{PAPER_SOURCE_LABEL}；套用第 {source_order} 列同標題 SourceWeb 分類"
+        st.session_state.last_fetch = {
+            "source_url": paper_source_note,
+            "article_text": f"【系統標註】報紙截圖 / 監測報告無 SourceWeb，已套用第 {source_order} 列同標題網路新聞分類結果。",
+            "error": None,
+            "字數": 0,
+        }
+        add_classified_rows(order, base, det)
+        applied_orders.append(order)
+        st.session_state.reuse_logs.append({
+            "原始列號": order,
+            "套用來源列號": source_order,
+            "訊息標題": base.get("訊息標題", ""),
+            "處理方式": "報紙截圖套用同標題 SourceWeb 分類",
+        })
+
+    if applied_orders:
+        sort_state_tables()
+    return applied_orders
+
+
+def apply_manual_result_to_same_title_orders(source_order: int, source_base_row: dict, manual_det: pd.DataFrame, source_url: str = "", article_text: str = "") -> list[int]:
+    """完成手動補卡後，自動把同標題新聞套用同一組卡片結果。
+
+    這不是新聞去重：每一列仍以自己的原始列號輸出與計入聲量。
+    用途是避免轉載新聞同標題、同卡片時，使用者必須逐篇重複手動補卡。
+    """
+    if manual_det is None or len(manual_det) == 0:
+        return []
+    key = reusable_title_key(source_base_row.get("訊息標題", ""))
+    if not key or not isinstance(st.session_state.get("news_df"), pd.DataFrame) or not len(st.session_state.news_df):
+        return []
+
+    applied_orders: list[int] = []
+    source_order = int(source_order)
+    for _, raw_row in st.session_state.news_df.iterrows():
+        try:
+            order = int(raw_row.get("原始列號"))
+        except Exception:
+            continue
+        if order == source_order:
+            continue
+        if reusable_title_key(raw_row.get("訊息標題", "")) != key:
+            continue
+
+        base = raw_row.to_dict()
+        order_source = source_url_for_order(order, as_text(base.get("Mastercard URL", ""))) or source_url or as_text(base.get("Mastercard URL", ""))
+        st.session_state.last_fetch = {
+            "source_url": order_source,
+            "article_text": article_text,
+            "error": None,
+            "字數": len(as_text(article_text)),
+        }
+        add_classified_rows(order, base, manual_det)
+        cache_completed_title_result(order, base)
+        applied_orders.append(order)
+        st.session_state.reuse_logs.append({
+            "原始列號": order,
+            "套用來源列號": source_order,
+            "訊息標題": base.get("訊息標題", ""),
+            "處理方式": "手動補卡相同標題套用",
+        })
+
+    if applied_orders:
+        sort_state_tables()
+    return applied_orders
+
+
+def preflight_paper_pending_if_needed(order: int, base_row: dict) -> bool:
+    """相同標題複用前，先檢查目前列是否為無 SourceWeb 的報紙監測紀錄。
+
+    這類列不能套用其他同標題新聞的已分類 / 無卡結果，必須獨立進待確認。
+    """
+    input_url = as_text(base_row.get("Mastercard URL", ""))
+    title = as_text(base_row.get("訊息標題", ""))
+    if not input_url:
+        note = f"【系統標註】{PAPER_REVIEW_REASON}；此列未提供可解析網址。"
+        paper_pending = force_paper_rows_to_pending(pd.DataFrame(), pd.DataFrame())
+        st.session_state.last_fetch = {"source_url": PAPER_SOURCE_LABEL, "article_text": note, "error": PAPER_REVIEW_REASON, "字數": len(note)}
+        st.session_state.last_detected = pd.DataFrame()
+        st.session_state.last_pending = paper_pending
+        add_pending(order, base_row, paper_pending, PAPER_SOURCE_LABEL)
+        st.session_state.reuse_logs.append({"原始列號": int(order), "套用來源列號": "", "訊息標題": title, "處理方式": "報紙無 SourceWeb，強制待確認"})
+        return True
+    if not likely_mastercard_report_url(input_url):
+        return False
+    html, error = fetch_html(input_url)
+    if error:
+        return False
+    extracted = extract_source_url_from_report_html(html)
+    if extracted:
+        return False
+    report_text = extract_text_from_html(html, input_url)
+    note = f"【系統標註】{PAPER_REVIEW_REASON}。此筆不套用相同標題既有結果；請人工開啟 Mastercard 監測報告檢查報紙圖片或掃描內容。"
+    article_text = f"{note}\n\n--- Mastercard 監測報告文字 ---\n{report_text}".strip()
+    detected, pending = detect_cards(title, article_text, PAPER_SOURCE_LABEL, st.session_state.keyword_df, st.session_state.card_master, st.session_state.org_rules, st.session_state.generic_terms)
+    paper_pending = force_paper_rows_to_pending(detected, pending)
+    st.session_state.last_fetch = {"source_url": PAPER_SOURCE_LABEL, "article_text": article_text, "error": PAPER_REVIEW_REASON, "字數": len(as_text(article_text))}
+    st.session_state.last_detected = pd.DataFrame()
+    st.session_state.last_pending = paper_pending
+    add_pending(order, base_row, paper_pending, PAPER_SOURCE_LABEL)
+    st.session_state.reuse_logs.append({"原始列號": int(order), "套用來源列號": "", "訊息標題": title, "處理方式": "報紙無 SourceWeb，強制待確認"})
+    return True
 def reuse_title_result_if_available(order: int, base_row: dict) -> bool:
+    """若同標題已有完成結果，套用到目前列。
+
+    v16.9 調整：
+    - 監測報告無 SourceWeb 的報紙截圖，若已有同標題且有 SourceWeb 的已分類網路新聞，允許套用卡片分類。
+    - 若沒有可套用的 SourceWeb 分類結果，報紙截圖仍強制進待確認並標註「報紙」。
+    """
     key = reusable_title_key(base_row.get("訊息標題", ""))
     if not key:
         return False
+
     cached = st.session_state.title_result_cache.get(key)
+    source_order = int(cached.get("source_order", -1)) if cached else -1
+    if cached and source_order == int(order):
+        cached = None
+
+    # 先檢查目前列是否為「監測報告無 SourceWeb」的報紙截圖。
+    # 但不同於 v16.8，現在報紙截圖可以套用同標題 SourceWeb 已分類結果。
+    is_paper_missing, paper_article_text = inspect_monitoring_record_without_sourceweb(
+        as_text(base_row.get("Mastercard URL", "")),
+        as_text(base_row.get("訊息標題", "")),
+    )
+
+    if is_paper_missing:
+        if cached and cached.get("type") == "已分類" and cached_classified_has_valid_sourceweb(cached):
+            remove_order(int(order))
+            det = pd.DataFrame(cached.get("classified", []))
+            if det.empty:
+                return False
+            if "判定依據" in det.columns:
+                det["判定依據"] = det["判定依據"].apply(
+                    lambda x: f"報紙截圖同標題套用第 {source_order} 列 SourceWeb 分類結果；{as_text(x)}"
+                )
+            else:
+                det["判定依據"] = f"報紙截圖同標題套用第 {source_order} 列 SourceWeb 分類結果"
+            paper_source_note = f"{PAPER_SOURCE_LABEL}；套用第 {source_order} 列同標題 SourceWeb 分類"
+            st.session_state.last_fetch = {
+                "source_url": paper_source_note,
+                "article_text": paper_article_text or f"【系統標註】報紙截圖 / 監測報告無 SourceWeb，已套用第 {source_order} 列同標題網路新聞分類結果。",
+                "error": None,
+                "字數": len(as_text(paper_article_text)),
+            }
+            add_classified_rows(int(order), base_row, det)
+            st.session_state.reuse_logs.append({
+                "原始列號": int(order),
+                "套用來源列號": source_order,
+                "訊息標題": base_row.get("訊息標題", ""),
+                "處理方式": "報紙截圖套用同標題 SourceWeb 分類",
+            })
+            return True
+
+        # 沒有同標題 SourceWeb 已分類結果時，仍維持報紙截圖需人工審核。
+        preflight_paper_pending_if_needed(order, base_row)
+        return True
+
     if not cached:
         return False
-    source_order = int(cached.get("source_order", -1))
-    if source_order == int(order):
-        return False
+
     remove_order(int(order))
     source_note = f"套用第 {source_order} 列相同標題結果"
     if cached.get("type") == "已分類":
@@ -1562,6 +2706,7 @@ def reuse_title_result_if_available(order: int, base_row: dict) -> bool:
             })
         if rows:
             st.session_state.classified = pd.concat([st.session_state.classified, pd.DataFrame(rows)], ignore_index=True)
+            sort_state_tables()
             st.session_state.processed_orders.add(int(order))
     elif cached.get("type") == "無卡排除":
         st.session_state.no_card_rows.append({
@@ -1573,6 +2718,7 @@ def reuse_title_result_if_available(order: int, base_row: dict) -> bool:
             "處理狀態": "無卡排除",
             "判定原因": source_note,
         })
+        sort_state_tables()
         st.session_state.no_card_orders.add(int(order))
     else:
         return False
@@ -1580,10 +2726,37 @@ def reuse_title_result_if_available(order: int, base_row: dict) -> bool:
     return True
 
 
+
+
+def force_paper_rows_to_pending(detected_df: pd.DataFrame, pending_df: pd.DataFrame) -> pd.DataFrame:
+    """報紙截圖列不自動分類；若有偵測候選，全部轉成待確認候選。"""
+    frames = []
+    if detected_df is not None and len(detected_df):
+        tmp = detected_df.copy()
+        tmp["處理狀態"] = "待確認"
+        tmp["待確認原因"] = PAPER_REVIEW_REASON
+        tmp["判定依據"] = tmp.get("判定依據", "").apply(lambda x: f"報紙人工審核候選；{as_text(x)}") if "判定依據" in tmp.columns else "報紙人工審核候選"
+        frames.append(tmp)
+    if pending_df is not None and len(pending_df):
+        tmp = pending_df.copy()
+        tmp["處理狀態"] = "待確認"
+        tmp["待確認原因"] = tmp.get("待確認原因", "").apply(lambda x: f"{PAPER_REVIEW_REASON}；{as_text(x)}") if "待確認原因" in tmp.columns else PAPER_REVIEW_REASON
+        frames.append(tmp)
+    if frames:
+        out = pd.concat(frames, ignore_index=True)
+        return dedupe_rule_results(out)
+    return pd.DataFrame([{
+        "銀行別": "",
+        "提及信用卡": "",
+        "卡組織": "",
+        "處理狀態": "待確認",
+        "判定依據": PAPER_REVIEW_REASON,
+        "待確認原因": PAPER_REVIEW_REASON,
+    }])
 def run_detection_for_row(row: pd.Series, keyword_df: pd.DataFrame, card_master: pd.DataFrame, org_rules: pd.DataFrame, generic_terms: set[str]) -> tuple[str, pd.DataFrame, pd.DataFrame, str, str | None]:
     title = as_text(row.get("訊息標題", ""))
     input_url = as_text(row.get("Mastercard URL", ""))
-    source_url, article_text, error = resolve_source_and_text(input_url, title) if input_url else ("", "", "沒有網址")
+    source_url, article_text, error = resolve_source_and_text(input_url, title)
     # Even if error exists, try to detect from title and any fallback text.
     detected, pending = detect_cards(title, article_text, source_url, keyword_df, card_master, org_rules, generic_terms)
     return source_url, detected, pending, article_text, error
@@ -1595,6 +2768,14 @@ def route_detection_result(order: int, base_row: dict, source_url: str, detected
     st.session_state.last_fetch = {"source_url": source_url, "article_text": article_text, "error": error, "字數": len(as_text(article_text))}
     st.session_state.last_detected = detected_df if detected_df is not None else pd.DataFrame()
     st.session_state.last_pending = pending_df if pending_df is not None else pd.DataFrame()
+
+    # 報紙截圖 / 監測報告無 SourceWeb：強制進待確認，不進已分類、不進無卡排除、不進抓取失敗。
+    if is_paper_source_missing_error(error) or is_paper_source_label(source_url):
+        paper_pending = force_paper_rows_to_pending(st.session_state.last_detected, st.session_state.last_pending)
+        st.session_state.last_detected = pd.DataFrame()
+        st.session_state.last_pending = paper_pending
+        add_pending(order, base_row, paper_pending, PAPER_SOURCE_LABEL)
+        return f"待確認：{PAPER_REVIEW_REASON}"
 
     if error and len(st.session_state.last_detected) == 0 and len(st.session_state.last_pending) == 0:
         add_failed(order, base_row, source_url, error)
@@ -1734,6 +2915,12 @@ def month_rows_for_output(news_df: pd.DataFrame, include_working_states: bool = 
                 "Mastercard URL": r.get("Mastercard URL", ""), "SourceWeb URL": r.get("SourceWeb URL", ""),
                 "處理狀態": "抓取失敗", "銀行別": "", "提及信用卡": "", "卡組織": "",
             })
+        for r in st.session_state.manual_queue_rows:
+            rows.append({
+                "原始列號": r.get("原始列號", ""), "監測日期": r.get("監測日期", ""), "訊息標題": r.get("訊息標題", ""),
+                "Mastercard URL": r.get("Mastercard URL", ""), "SourceWeb URL": r.get("SourceWeb URL", ""),
+                "處理狀態": "手動補卡", "銀行別": "", "提及信用卡": "", "卡組織": "",
+            })
         rows.extend(build_unprocessed_rows(news_df))
     rows = sorted(rows, key=lambda x: (get_month_sheet(x.get("監測日期", "")), int(x.get("原始列號") or 0), as_text(x.get("銀行別", "")), as_text(x.get("提及信用卡", ""))))
     return rows
@@ -1757,6 +2944,58 @@ def autosize_worksheet(ws, max_width: int = 46):
         values = [as_text(ws.cell(row, col).value) for row in range(1, min(ws.max_row, 300) + 1)]
         width = min(max([len(v) for v in values] + [8]) + 2, max_width)
         ws.column_dimensions[letter].width = width
+
+
+def state_rows_for_export(news_df: pd.DataFrame) -> list[dict]:
+    """建立可供下次上傳恢復的工作臺狀態表。
+
+    這張表比月份明細多保留原因欄位；使用者下載暫存檔後，可再上傳此檔繼續分類。
+    """
+    rows: list[dict] = []
+    if isinstance(st.session_state.get("classified"), pd.DataFrame) and len(st.session_state.classified):
+        for _, r in st.session_state.classified.iterrows():
+            rows.append({
+                **{c: r.get(c, "") for c in MONTH_COLUMNS},
+                "判定依據": r.get("判定依據", ""),
+                "待確認原因": "", "錯誤原因": "", "判定原因": "", "移入原因": "",
+            })
+    for r in st.session_state.get("no_card_rows", []):
+        rows.append({
+            **{c: r.get(c, "") for c in MONTH_COLUMNS},
+            "判定依據": "", "待確認原因": "", "錯誤原因": "",
+            "判定原因": r.get("判定原因", ""), "移入原因": "",
+        })
+    for r in st.session_state.get("pending_rows", []):
+        rows.append({
+            **{c: r.get(c, "") for c in MONTH_COLUMNS},
+            "判定依據": r.get("判定依據", ""),
+            "待確認原因": r.get("待確認原因", ""),
+            "錯誤原因": "", "判定原因": "", "移入原因": "",
+        })
+    for r in st.session_state.get("failed_rows", []):
+        rows.append({
+            "原始列號": r.get("原始列號", ""), "監測日期": r.get("監測日期", ""),
+            "訊息標題": r.get("訊息標題", ""), "Mastercard URL": r.get("Mastercard URL", ""),
+            "SourceWeb URL": r.get("SourceWeb URL", ""), "處理狀態": "抓取失敗",
+            "銀行別": "", "提及信用卡": "", "卡組織": "",
+            "判定依據": "", "待確認原因": "",
+            "錯誤原因": r.get("錯誤原因", ""), "判定原因": "", "移入原因": "",
+        })
+    for r in st.session_state.get("manual_queue_rows", []):
+        rows.append({
+            "原始列號": r.get("原始列號", ""), "監測日期": r.get("監測日期", ""),
+            "訊息標題": r.get("訊息標題", ""), "Mastercard URL": r.get("Mastercard URL", ""),
+            "SourceWeb URL": r.get("SourceWeb URL", ""), "處理狀態": "手動補卡",
+            "銀行別": "", "提及信用卡": "", "卡組織": "",
+            "判定依據": "", "待確認原因": "", "錯誤原因": "", "判定原因": "",
+            "移入原因": r.get("移入原因", ""),
+        })
+    for r in build_unprocessed_rows(news_df):
+        rows.append({
+            **{c: r.get(c, "") for c in MONTH_COLUMNS},
+            "判定依據": "", "待確認原因": "", "錯誤原因": "", "判定原因": "", "移入原因": "",
+        })
+    return sorted(rows, key=lambda x: (int(x.get("原始列號") or 0), as_text(x.get("處理狀態", "")), as_text(x.get("銀行別", "")), as_text(x.get("提及信用卡", ""))))
 
 
 def workbook_bytes(setting_bytes: bytes, news_df: pd.DataFrame, include_working_states: bool = False) -> bytes:
@@ -1813,6 +3052,22 @@ def workbook_bytes(setting_bytes: bytes, news_df: pd.DataFrame, include_working_
                 cell.font = body_font
                 cell.border = border
         autosize_worksheet(ws, max_width=60)
+
+    if include_working_states:
+        ws_state = wb.create_sheet(TEMP_STATE_SHEET)
+        for c, h in enumerate(TEMP_STATE_COLUMNS, 1):
+            cell = ws_state.cell(1, c, h)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = border
+        for r_idx, item in enumerate(state_rows_for_export(news_df), 2):
+            for c_idx, h in enumerate(TEMP_STATE_COLUMNS, 1):
+                cell = ws_state.cell(r_idx, c_idx, item.get(h, ""))
+                cell.font = body_font
+                cell.border = border
+        autosize_worksheet(ws_state, max_width=70)
+
     out = BytesIO()
     wb.save(out)
     return out.getvalue()
@@ -1857,7 +3112,7 @@ def check_settings(card_master: pd.DataFrame, keyword_df: pd.DataFrame) -> tuple
 # -----------------------------------------------------------------------------
 
 
-st.set_page_config(page_title="信用卡新聞分類工具", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="信用卡聲量分析系統", layout="wide", initial_sidebar_state="collapsed")
 init_state()
 
 st.markdown(
@@ -1865,32 +3120,103 @@ st.markdown(
     <style>
     .main-title {font-size: 30px; font-weight: 800; margin-bottom: 4px;}
     .subtle {color:#666; font-size: 14px;}
+    .step-guide {color:#777; font-size: 13px; line-height: 1.55; margin-top: 2px; margin-bottom: 12px;}
+    .step-title {font-size: 20px; font-weight: 800; margin: 20px 0 6px 0;}
+    .step-caption {color:#777; font-size: 13px; margin: -2px 0 10px 0;}
     .status-strip {border:1px solid #ddd; border-radius:10px; padding:10px 12px; background:#fafafa; margin:8px 0 14px 0;}
     .result-chip {display:inline-block; padding:5px 9px; border-radius:16px; margin:3px 4px 3px 0; border:1px solid #ddd; background:#f7f7f7;}
     .danger {color:#b00020; font-weight:700;}
+    .article-scroll-box {
+        max-height: 520px;
+        overflow-y: auto;
+        overflow-x: hidden;
+        white-space: pre-wrap;
+        word-break: break-word;
+        border: 1px solid #ddd;
+        border-radius: 10px;
+        padding: 12px 14px;
+        background: #fff;
+        line-height: 1.65;
+        font-size: 14px;
+    }
+    .link-row {margin: 2px 0 6px 0; font-size: 14px; word-break: break-all;}
+    .link-row a {word-break: break-all;}
+    mark {background: #fff3a3; padding: 0 2px; border-radius: 2px;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown(f"<div class='main-title'>信用卡新聞分類工具</div><div class='subtle'>{APP_VERSION}｜兩檔上傳版 + 爬蟲正文抽取模式：raw data + 信用卡分類設定與聲量總表</div>", unsafe_allow_html=True)
+st.markdown(
+    f"""
+    <div class='main-title'>信用卡聲量分析系統</div>
+    <div class='subtle'>{APP_VERSION}</div>
+    <div class='step-guide'>
+    Step 1 上傳檔案或恢復進度 → Step 2 執行單一 / 批量偵測 → Step 3 在下方表格處理待確認、無卡排除與手動補卡 → Step 4 下載暫存檔或完成版。
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-with st.expander("管理上傳檔案", expanded=True):
-    c1, c2 = st.columns(2)
+st.markdown("<div class='step-title'>Step 1｜上傳檔案 / 恢復進度</div>", unsafe_allow_html=True)
+with st.expander("上傳檔案", expanded=True):
+    c1, c2, c3 = st.columns(3)
     with c1:
         raw_file = st.file_uploader("① 每月 Mastercard raw data", type=["xlsx", "xls"], key="raw_file_v13")
     with c2:
         setting_file = st.file_uploader("② 固定的信用卡聲量 + 關鍵字判定表", type=["xlsx"], key="setting_file_v13")
-    st.caption("設定表需包含：信用卡清單_總聲量、關鍵字判定表、January-December。")
+    with c3:
+        resume_workbook_file = st.file_uploader("③ 可選：上次下載的暫存月度結果表", type=["xlsx"], key="resume_workbook_v174")
+    st.caption("新月份：raw data + 設定表；續作：暫存月度結果表 + 設定表。")
 
-if not raw_file or not setting_file:
-    st.info("請先上傳兩個檔案。")
+saved_payload = load_saved_progress()
+with st.expander("進度", expanded=False):
+    st.caption(saved_progress_label(saved_payload))
+    cc1, cc2, cc3 = st.columns(3)
+    with cc1:
+        if st.button("恢復上次進度", disabled=not bool(saved_payload), use_container_width=True, key="btn_restore_progress_v172"):
+            if restore_progress_to_state(saved_payload):
+                st.success("已恢復上次進度。")
+                save_progress_to_disk("restore")
+                st.rerun()
+            else:
+                st.error("恢復失敗，請重新上傳檔案。")
+    with cc2:
+        if st.button("立即保存目前進度", disabled=not isinstance(st.session_state.get("news_df"), pd.DataFrame) or st.session_state.get("news_df").empty, use_container_width=True, key="btn_save_progress_v172"):
+            if save_progress_to_disk("manual"):
+                st.success("已保存目前進度。")
+            else:
+                st.warning("目前沒有可保存的工作進度。")
+    with cc3:
+        if st.button("清除已保存進度", disabled=not bool(saved_payload), use_container_width=True, key="btn_clear_progress_v172"):
+            clear_saved_progress_file()
+            st.warning("已清除已保存進度。")
+            st.rerun()
+    if st.session_state.get("last_autosave_error"):
+        st.caption(f"保存錯誤：{st.session_state.last_autosave_error}")
+
+use_temp_workbook_resume = bool(resume_workbook_file and setting_file)
+if resume_workbook_file and setting_file:
+    raw_bytes = resume_workbook_file.getvalue()
+    setting_bytes = setting_file.getvalue()
+    raw_sig = "temp_resume|" + file_signature(getattr(resume_workbook_file, "name", "temp_resume"), raw_bytes)
+    setting_sig = file_signature(getattr(setting_file, "name", "setting"), setting_bytes)
+    st.info("已選擇以『暫存月度結果表』接續上次進度；系統會讀取已分類、待確認、抓取失敗、手動補卡與未處理狀態。")
+elif raw_file and setting_file:
+    raw_bytes = raw_file.getvalue()
+    setting_bytes = setting_file.getvalue()
+    raw_sig = file_signature(getattr(raw_file, "name", "raw"), raw_bytes)
+    setting_sig = file_signature(getattr(setting_file, "name", "setting"), setting_bytes)
+elif st.session_state.get("raw_bytes") and st.session_state.get("setting_bytes") and isinstance(st.session_state.get("news_df"), pd.DataFrame) and len(st.session_state.news_df):
+    raw_bytes = st.session_state.raw_bytes
+    setting_bytes = st.session_state.setting_bytes
+    raw_sig = st.session_state.raw_sig
+    setting_sig = st.session_state.setting_sig
+    use_temp_workbook_resume = bool(st.session_state.get("loaded_from_temp_workbook", False))
+    st.info("目前使用已恢復的上次進度；若要更換月份或設定表，請重新上傳檔案。")
+else:
+    st.info("請先上傳 raw data + 設定表，或上傳暫存月度結果表 + 設定表；也可在「進度保存 / 恢復」中恢復上次進度。")
     st.stop()
-
-raw_bytes = raw_file.getvalue()
-setting_bytes = setting_file.getvalue()
-raw_sig = file_signature(getattr(raw_file, "name", "raw"), raw_bytes)
-setting_sig = file_signature(getattr(setting_file, "name", "setting"), setting_bytes)
 
 # 上傳檔案有更換時才重新讀取設定；一般按鈕操作只用 session_state 中的資料，避免每次重跑都重讀 Excel。
 files_changed = (st.session_state.get("raw_sig") != raw_sig) or (st.session_state.get("setting_sig") != setting_sig)
@@ -1901,14 +3227,21 @@ if files_changed:
     st.session_state.raw_bytes = raw_bytes
     st.session_state.setting_bytes = setting_bytes
     try:
-        st.session_state.news_df = read_raw_news_cached(raw_bytes, getattr(raw_file, "name", "raw.xlsx"))
         st.session_state.card_master = load_card_master(setting_bytes)
         st.session_state.keyword_df = load_keyword_rules(setting_bytes)
         st.session_state.org_rules = load_org_rules(setting_bytes)
         st.session_state.generic_terms = load_generic_terms(setting_bytes)
         st.session_state.missing_rules_df, st.session_state.orphan_rules_df = check_settings(st.session_state.card_master, st.session_state.keyword_df)
+        if use_temp_workbook_resume:
+            progress = read_temp_workbook_progress(raw_bytes)
+            restore_temp_workbook_progress_to_state(progress)
+            st.session_state.loaded_from_temp_workbook = True
+            st.session_state.last_message = "已從暫存月度結果表恢復工作進度，可繼續處理待確認、抓取失敗與未處理項目。"
+        else:
+            st.session_state.news_df = read_raw_news_cached(raw_bytes, getattr(raw_file, "name", "raw.xlsx"))
+            st.session_state.loaded_from_temp_workbook = False
     except Exception as e:
-        st.error("檔案讀取失敗。請確認分頁名稱與欄位是否符合定案格式。")
+        st.error("檔案讀取失敗。請確認分頁名稱、欄位或暫存月度結果表格式是否符合定案格式。")
         st.exception(e)
         st.stop()
 
@@ -1934,6 +3267,9 @@ metrics[5].metric("未處理", unprocessed_count)
 
 status_text = f"信用卡清單 {len(card_master)} 筆｜啟用關鍵字規則 {len(keyword_df)} 筆｜缺少關鍵字規則的卡 {len(missing_rules_df)} 筆｜關鍵字對不到聲量表 {len(orphan_rules_df)} 筆"
 st.markdown(f"<div class='status-strip'><b>設定表狀態：</b>{status_text}</div>", unsafe_allow_html=True)
+
+st.markdown("<div class='step-title'>Step 2｜執行新聞偵測</div>", unsafe_allow_html=True)
+st.markdown("<div class='step-caption'>選擇新聞後可單筆偵測，或從目前列開始批量偵測。</div>", unsafe_allow_html=True)
 
 # News selector
 news_options = []
@@ -2014,7 +3350,7 @@ if batch_clicked:
     st.success(f"批次完成：有效處理 {effective}/{int(batch_size)}；自動套用相同標題結果 {reused} 筆；抓取失敗不計入有效筆數。")
 
 # Results panel
-st.subheader("本次偵測結果（已自動分流）")
+st.markdown("**本次偵測結果**")
 res1, res2 = st.columns(2)
 with res1:
     st.markdown("**高信心 / 已分類**")
@@ -2033,50 +3369,13 @@ if st.session_state.reuse_logs:
     with st.expander("相同標題結果複用紀錄", expanded=False):
         st.dataframe(pd.DataFrame(st.session_state.reuse_logs[-100:]), use_container_width=True, height=220)
 
-# Export bar
+# Download status only; compact download panel is placed at the bottom to keep the main workspace short.
 unfinished = len(st.session_state.pending_orders) + len(st.session_state.failed_orders) + len(st.session_state.manual_orders) + unprocessed_count
-st.divider()
-st.subheader("下載")
-if unfinished > 0:
-    st.warning(f"目前仍有未完成項目：待確認 {len(st.session_state.pending_orders)}、抓取失敗 {len(st.session_state.failed_orders)}、手動補卡 {len(st.session_state.manual_orders)}、未處理 {unprocessed_count}。建議處理完再下載完成版。")
-else:
-    st.success("所有原始列都已處理完成，可下載完成版聲量總表。")
-
-out1, out2 = st.columns(2)
-with out1:
-    if st.button("產生暫存月度結果表", use_container_width=True, key="btn_build_temp_workbook"):
-        with st.spinner("正在依模板產生暫存月度結果表..."):
-            st.session_state.temp_workbook_bytes = workbook_bytes(setting_bytes, news_df, include_working_states=True)
-            st.session_state.download_status_message = "暫存工作簿已產生。"
-    if st.session_state.get("temp_workbook_bytes"):
-        st.download_button(
-            "下載暫存月度結果表（含待確認/失敗/未處理）",
-            data=st.session_state.temp_workbook_bytes,
-            file_name="信用卡新聞月度結果表_暫存版.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="download_temp_workbook",
-        )
-with out2:
-    if st.button("產生完成版月度聲量表", use_container_width=True, disabled=unfinished > 0, key="btn_build_final_workbook"):
-        with st.spinner("正在依模板產生完成版月度聲量表..."):
-            st.session_state.final_workbook_bytes = workbook_bytes(setting_bytes, news_df, include_working_states=False)
-            st.session_state.download_status_message = "完成版聲量總表已產生。"
-    if st.session_state.get("final_workbook_bytes"):
-        st.download_button(
-            "下載完成版月度聲量表（只含已分類/無卡排除）",
-            data=st.session_state.final_workbook_bytes,
-            file_name="信用卡新聞月度聲量表_完成版.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            disabled=unfinished > 0,
-            key="download_final_workbook",
-        )
-if st.session_state.get("download_status_message"):
-    st.caption(st.session_state.download_status_message)
 
 # Workbench tabs
 st.divider()
+st.markdown("<div class='step-title'>Step 3｜人工分類工作臺</div>", unsafe_allow_html=True)
+st.markdown("<div class='step-caption'>主要處理區：待確認、抓取失敗、無卡排除與手動補卡。下方表格勾選後可直接移動分類，不會重新跑整批偵測。</div>", unsafe_allow_html=True)
 tabs = st.tabs(["待確認", "抓取失敗", "無卡排除", "全文預覽 + 手動補卡", "設定表檢查", "完整結果"])
 
 with tabs[0]:
@@ -2115,7 +3414,7 @@ with tabs[0]:
                 cache_completed_title_result(int(order), base)
             st.session_state.pending_rows = [r for r in st.session_state.pending_rows if pending_record_key(r) not in selected_keys]
             refresh_pending_orders()
-            st.rerun()
+            save_progress_to_disk("auto"); st.rerun()
 
         if submit_to_no_card and not selected_keys:
             st.warning("請先勾選待確認項目。")
@@ -2130,17 +3429,21 @@ with tabs[0]:
                     base = news_df[news_df["原始列號"] == order].iloc[0].to_dict()
                     add_no_card(order, base, "待確認項目人工選取加入無卡排除")
                     cache_completed_title_result(order, base)
-            st.rerun()
+            save_progress_to_disk("auto"); st.rerun()
 
         if submit_to_manual and not selected_keys:
             st.warning("請先勾選待確認項目。")
         if submit_to_manual and selected_keys:
-            for order in sorted(set(selected_pending["原始列號"].astype(int).tolist())):
+            full_pending = pd.DataFrame(st.session_state.pending_rows)
+            selected_full = full_pending[full_pending.apply(lambda r: pending_record_key(r) in selected_keys, axis=1)]
+            for order, grp in selected_full.groupby("原始列號"):
+                order = int(order)
                 base = news_df[news_df["原始列號"] == order].iloc[0].to_dict()
-                add_manual_queue(order, base, "待確認項目移入手動補卡")
+                source_url = as_text(grp.iloc[0].get("SourceWeb URL", ""))
+                add_manual_queue(order, base, "待確認項目移入手動補卡", source_url=source_url)
             st.session_state.pending_rows = [r for r in st.session_state.pending_rows if pending_record_key(r) not in selected_keys]
             refresh_pending_orders()
-            st.rerun()
+            save_progress_to_disk("auto"); st.rerun()
     else:
         st.info("目前沒有待確認資料。")
 
@@ -2167,7 +3470,7 @@ with tabs[1]:
                 order = int(r["原始列號"])
                 base = news_df[news_df["原始列號"] == order].iloc[0].to_dict()
                 add_manual_queue(order, base, f"抓取失敗移入手動補卡：{as_text(r.get('錯誤原因',''))}", source_url=as_text(r.get("SourceWeb URL", "")))
-            st.rerun()
+            save_progress_to_disk("auto"); st.rerun()
     else:
         st.info("目前沒有抓取失敗資料。")
 
@@ -2194,17 +3497,17 @@ with tabs[2]:
                 order = int(r["原始列號"])
                 base = news_df[news_df["原始列號"] == order].iloc[0].to_dict()
                 add_manual_queue(order, base, "無卡排除改為手動補卡", source_url=as_text(r.get("SourceWeb URL", "")))
-            st.rerun()
+            save_progress_to_disk("auto"); st.rerun()
     else:
         st.info("目前沒有無卡排除資料。")
 
 with tabs[3]:
-    st.caption("在此查看全文並補卡。人工補卡會直接轉為已分類，不會在最終表中留下人工補卡狀態。")
+    st.caption("在此查看 SourceWeb 全文並暫存多張人工補卡；確認同一篇新聞的所有卡片都補完後，再一次加入已分類。")
     manual_df = pd.DataFrame(st.session_state.manual_queue_rows)
     target_order = selected_order
     if len(manual_df):
         manual_options = [f"{int(r['原始列號'])}. {as_text(r['訊息標題'])[:70]}" for _, r in manual_df.iterrows()]
-        active_order = int(st.session_state.get("manual_active_order", int(manual_df.iloc[0]["原始列號"])))
+        active_order = int(st.session_state.get("manual_active_order") or int(manual_df.iloc[0]["原始列號"]))
         manual_index = 0
         for idx, opt in enumerate(manual_options):
             try:
@@ -2213,48 +3516,181 @@ with tabs[3]:
                     break
             except Exception:
                 pass
-        chosen_manual = st.selectbox("手動補卡清單", manual_options, index=manual_index, key="manual_queue_selector_v151")
+        chosen_manual = st.selectbox("手動補卡清單", manual_options, index=manual_index, key="manual_queue_selector_v163")
         target_order = int(chosen_manual.split('.', 1)[0])
         st.session_state.manual_active_order = target_order
+        st.session_state.selected_order = target_order
     else:
         st.info("手動補卡清單目前為空；下方會使用目前選取新聞。")
+
     target_base = news_df[news_df["原始列號"] == int(target_order)].iloc[0].to_dict()
     queue_row = next((r for r in st.session_state.manual_queue_rows if int(r.get("原始列號", -1)) == int(target_order)), {})
+
+    hydrated = hydrate_manual_article(int(target_order), target_base, queue_row) if queue_row else {"source_url": as_text(target_base.get("Mastercard URL", "")), "article_text": "", "note": ""}
+    queue_row = next((r for r in st.session_state.manual_queue_rows if int(r.get("原始列號", -1)) == int(target_order)), queue_row)
+    preview_text = as_text(hydrated.get("article_text", ""))
+    preview_source = as_text(hydrated.get("source_url", "")) or as_text(target_base.get("Mastercard URL", ""))
+    preview_note = as_text(hydrated.get("note", "")) or as_text(queue_row.get("內文標註", ""))
+
     st.markdown(f"**目前處理：第 {int(target_order)} 列｜{as_text(target_base.get('訊息標題',''))}**")
-    info = st.session_state.last_fetch or {}
-    preview_text = as_text(queue_row.get("全文", "")) or (info.get("article_text", "") if int(target_order) == int(selected_order) else "")
-    preview_source = as_text(queue_row.get("SourceWeb URL", "")) or (info.get("source_url", "") if int(target_order) == int(selected_order) else as_text(target_base.get("Mastercard URL", "")))
-    st.write({"SourceWeb URL": preview_source, "目前全文字數": len(as_text(preview_text)), "移入原因": as_text(queue_row.get("移入原因", ""))})
+    st.markdown(
+        f"<div class='link-row'><b>Mastercard 監測連結：</b>{markdown_link(target_base.get('Mastercard URL', ''), target_base.get('Mastercard URL', ''))}</div>"
+        f"<div class='link-row'><b>SourceWeb 原始新聞：</b>{markdown_link(preview_source, preview_source)}</div>"
+        f"<div class='link-row'><b>目前全文字數：</b>{len(preview_text)}｜<b>移入原因：</b>{html_lib.escape(as_text(queue_row.get('移入原因', '')))}</div>",
+        unsafe_allow_html=True,
+    )
+    if preview_note:
+        st.warning(preview_note)
+
+    # 已分類結果修正：同一新聞若系統原本已分類錯卡，人工補卡時可以先移除錯誤卡片。
+    existing_classified_for_order = pd.DataFrame()
+    if isinstance(st.session_state.get("classified"), pd.DataFrame) and len(st.session_state.classified):
+        existing_classified_for_order = st.session_state.classified[
+            st.session_state.classified["原始列號"] == int(target_order)
+        ].copy()
+    if len(existing_classified_for_order):
+        st.markdown("**本列目前已分類卡片（可移除錯誤卡片）**")
+        fix_df = existing_classified_for_order.copy()
+        fix_df.insert(0, "選取", False)
+        fix_cols = ["選取", "原始列號", "銀行別", "提及信用卡", "卡組織", "判定依據"]
+        with st.form(key=f"classified_fix_form_{int(target_order)}"):
+            edited_fix = st.data_editor(
+                fix_df[fix_cols],
+                use_container_width=True,
+                hide_index=True,
+                height=160,
+                key=f"classified_fix_editor_{int(target_order)}",
+                column_config={"選取": st.column_config.CheckboxColumn("選取")},
+                disabled=[c for c in fix_cols if c != "選取"],
+            )
+            remove_existing_classified = st.form_submit_button("移除選取已分類卡片", use_container_width=True)
+        if remove_existing_classified:
+            selected_existing_keys = [
+                classified_record_key(r)
+                for _, r in edited_fix[edited_fix["選取"] == True].iterrows()
+            ] if "選取" in edited_fix.columns else []
+            if not selected_existing_keys:
+                st.warning("請先勾選要移除的已分類卡片。")
+            else:
+                removed_count = remove_classified_rows_by_keys(selected_existing_keys)
+                st.session_state.last_message = f"第 {int(target_order)} 列已移除 {removed_count} 筆已分類卡片。"
+                save_progress_to_disk("auto"); st.rerun()
+    else:
+        st.caption("本列目前沒有已分類卡片；可直接在右側暫存人工補卡。")
+
     left, right = st.columns([1.25, 1])
     with left:
-        pasted_text = st.text_area("全文預覽 / 可貼上人工全文", value=preview_text[:12000], height=360)
-        if st.button("用貼上全文重新偵測", use_container_width=True, disabled=not pasted_text.strip(), key="btn_redetect_pasted_text"):
-            det, pen = detect_cards(target_base.get("訊息標題", ""), pasted_text, preview_source, keyword_df, card_master, org_rules, generic_terms)
-            remove_order(int(target_order))
-            if len(det):
+        pasted_text = st.text_area("SourceWeb 全文 / 可貼上人工全文", value=preview_text[:16000], height=260, key=f"manual_text_{int(target_order)}")
+        staged_cards = st.session_state.manual_staged_cards.get(int(target_order), [])
+        st.markdown("**螢光筆標記全文中的卡片關鍵字**")
+        if pasted_text.strip():
+            st.markdown(
+                f"<div class='article-scroll-box'>{highlighted_article_html(pasted_text, keyword_df, card_master, staged_cards, max_chars=30000)}</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("目前沒有可顯示的新聞全文。若 SourceWeb 為報紙圖片或無法解析，請貼上人工全文。")
+
+        col_redetect, col_refresh = st.columns(2)
+        with col_redetect:
+            if st.button("用貼上全文重新偵測", use_container_width=True, disabled=not pasted_text.strip(), key="btn_redetect_pasted_text_v163"):
+                det, pen = detect_cards(target_base.get("訊息標題", ""), pasted_text, preview_source, keyword_df, card_master, org_rules, generic_terms)
                 st.session_state.last_fetch = {"source_url": preview_source or "人工貼全文", "article_text": pasted_text, "error": None, "字數": len(pasted_text)}
-                add_classified_rows(int(target_order), target_base, det)
-            if len(pen):
-                add_pending(int(target_order), target_base, pen, preview_source or "人工貼全文")
-            if len(det) == 0 and len(pen) == 0:
-                add_no_card(int(target_order), target_base, "人工全文未偵測到信用卡")
-            remove_manual_queue_order(int(target_order))
-            cache_completed_title_result(int(target_order), target_base)
-            st.rerun()
+                update_manual_queue_row(int(target_order), **{"SourceWeb URL": preview_source or "人工貼全文", "全文": pasted_text, "內文標註": ""})
+                added_count, skipped_count = stage_detected_cards_from_pasted_text(int(target_order), det, pen)
+                if added_count:
+                    st.session_state.last_message = (
+                        f"第 {int(target_order)} 列已用貼上全文重新偵測，"
+                        f"並先加入 {added_count} 張候選卡到右側暫存卡片區。"
+                        f"請確認是否還要補卡或移除候選卡，再按『完成補卡，全部加入已分類』。"
+                    )
+                else:
+                    st.session_state.last_message = (
+                        f"第 {int(target_order)} 列已用貼上全文重新偵測，但沒有新增候選卡片。"
+                        f"請人工補卡，或確認無卡後移回無卡排除。"
+                    )
+                save_progress_to_disk("auto"); st.rerun()
+        with col_refresh:
+            if st.button("重新載入 SourceWeb 全文", use_container_width=True, key="btn_refresh_sourceweb_manual_v163"):
+                update_manual_queue_row(int(target_order), **{"全文": "", "內文標註": ""})
+                save_progress_to_disk("auto"); st.rerun()
+
     with right:
+        st.markdown("**暫存本篇要補的卡片**")
         banks = sorted(card_master["銀行別"].dropna().unique().tolist())
-        bank = st.selectbox("銀行別", banks, key="manual_bank_v143")
+        bank = st.selectbox("銀行別", banks, key="manual_bank_v163")
         cards_for_bank = card_master[card_master["銀行別"] == bank]
-        card = st.selectbox("提及信用卡", cards_for_bank["提及信用卡"].dropna().unique().tolist(), key="manual_card_v143")
+        card = st.selectbox("提及信用卡", cards_for_bank["提及信用卡"].dropna().unique().tolist(), key="manual_card_v163")
         orgs = cards_for_bank[cards_for_bank["提及信用卡"] == card]["卡組織"].fillna("").astype(str).tolist()
-        org = st.selectbox("卡組織", orgs if orgs else [""], key="manual_org_v143")
-        if st.button("加入已分類", use_container_width=True, key="btn_manual_to_classified_v151"):
-            manual_det = pd.DataFrame([{"銀行別": bank, "提及信用卡": card, "卡組織": org, "處理狀態": "已分類", "判定依據": "人工補卡"}])
-            st.session_state.last_fetch = {"source_url": preview_source, "article_text": pasted_text, "error": None, "字數": len(as_text(pasted_text))}
-            add_classified_rows(int(target_order), target_base, manual_det)
-            cache_completed_title_result(int(target_order), target_base)
-            st.session_state.last_message = f"第 {int(target_order)} 列已由手動補卡加入已分類。"
-            st.rerun()
+        org = st.selectbox("卡組織", orgs if orgs else [""], key="manual_org_v163")
+        if st.button("加入本篇暫存補卡清單", use_container_width=True, key="btn_stage_manual_card_v163"):
+            add_staged_manual_card(int(target_order), bank, card, org)
+            st.session_state.last_message = f"已暫存：{bank}｜{card}｜{org}"
+            save_progress_to_disk("auto"); st.rerun()
+
+        staged_cards = st.session_state.manual_staged_cards.get(int(target_order), [])
+        if staged_cards:
+            staged_df = pd.DataFrame(staged_cards)
+            staged_df.insert(0, "選取", False)
+            with st.form(key=f"manual_staged_form_{int(target_order)}"):
+                edited_staged = st.data_editor(staged_df, use_container_width=True, hide_index=True, height=200, key=f"manual_staged_editor_{int(target_order)}")
+                c1, c2 = st.columns(2)
+                with c1:
+                    remove_selected = st.form_submit_button("移除選取暫存卡", use_container_width=True)
+                with c2:
+                    finish_manual = st.form_submit_button("完成補卡，全部加入已分類", use_container_width=True)
+            selected_remove = []
+            if "選取" in edited_staged.columns:
+                selected_remove = [manual_card_key(r) for _, r in edited_staged[edited_staged["選取"] == True].iterrows()]
+            if remove_selected:
+                if not selected_remove:
+                    st.warning("請先勾選要移除的暫存卡。")
+                else:
+                    remove_staged_manual_cards(int(target_order), selected_remove)
+                    save_progress_to_disk("auto"); st.rerun()
+            if finish_manual:
+                current_staged = st.session_state.manual_staged_cards.get(int(target_order), [])
+                if not current_staged:
+                    st.warning("請先加入至少一張卡片。")
+                else:
+                    manual_det = pd.DataFrame(current_staged)
+                    st.session_state.last_fetch = {"source_url": preview_source, "article_text": pasted_text, "error": None, "字數": len(as_text(pasted_text))}
+                    add_classified_rows(int(target_order), target_base, manual_det)
+                    cache_completed_title_result(int(target_order), target_base)
+                    applied_same_title = apply_manual_result_to_same_title_orders(
+                        int(target_order),
+                        target_base,
+                        manual_det,
+                        preview_source,
+                        pasted_text,
+                    )
+                    remove_manual_queue_order(int(target_order))
+                    if applied_same_title:
+                        st.session_state.last_message = (
+                            f"第 {int(target_order)} 列已完成補卡，共加入 {len(current_staged)} 張卡；"
+                            f"並自動套用到 {len(applied_same_title)} 筆相同標題新聞："
+                            f"{', '.join(map(str, applied_same_title[:20]))}"
+                            f"{'...' if len(applied_same_title) > 20 else ''}。"
+                        )
+                    else:
+                        st.session_state.last_message = f"第 {int(target_order)} 列已完成補卡，共加入 {len(current_staged)} 張卡。"
+                    save_progress_to_disk("auto"); st.rerun()
+        else:
+            st.info("尚未暫存卡片。若本篇有多張卡，請逐張加入暫存清單，全部補完後再按完成。")
+
+        st.divider()
+        st.markdown("**確認本篇沒有信用卡**")
+        st.caption("若人工檢查後確認這篇新聞沒有任何應計入的信用卡，可直接移回無卡排除；若已暫存卡片，按下後會清空本篇暫存卡。")
+        if st.button("確認無卡，移回無卡排除", use_container_width=True, key=f"btn_manual_back_to_no_card_{int(target_order)}"):
+            move_manual_item_to_no_card(
+                int(target_order),
+                target_base,
+                preview_source,
+                pasted_text,
+                "人工補卡檢查後確認無卡",
+            )
+            st.session_state.last_message = f"第 {int(target_order)} 列已移回無卡排除。"
+            save_progress_to_disk("auto"); st.rerun()
 
 with tabs[4]:
     st.markdown("**信用卡清單有、但關鍵字判定表沒有啟用規則**")
@@ -2264,8 +3700,91 @@ with tabs[4]:
 
 with tabs[5]:
     st.markdown("**已分類卡片結果**")
-    st.dataframe(st.session_state.classified, use_container_width=True, height=260)
+    st.caption("若系統誤抓或人工補卡後同一則新聞多出錯誤卡片，可在這裡勾選並移除。")
+    sort_state_tables()
+    if isinstance(st.session_state.get("classified"), pd.DataFrame) and len(st.session_state.classified):
+        classified_edit = st.session_state.classified.copy()
+        classified_edit.insert(0, "選取", False)
+        result_cols = ["選取", "原始列號", "監測日期", "訊息標題", "銀行別", "提及信用卡", "卡組織", "SourceWeb URL", "判定依據"]
+        result_cols = [c for c in result_cols if c in classified_edit.columns]
+        with st.form("classified_result_remove_form_v171"):
+            edited_result = st.data_editor(
+                classified_edit[result_cols],
+                use_container_width=True,
+                height=320,
+                key="classified_result_remove_editor_v171",
+                column_config={"選取": st.column_config.CheckboxColumn("選取")},
+                disabled=[c for c in result_cols if c != "選取"],
+            )
+            remove_result_rows = st.form_submit_button("移除選取已分類卡片", use_container_width=True)
+        if remove_result_rows:
+            selected_result_keys = [
+                classified_record_key(r)
+                for _, r in edited_result[edited_result["選取"] == True].iterrows()
+            ] if "選取" in edited_result.columns else []
+            if not selected_result_keys:
+                st.warning("請先勾選要移除的已分類卡片。")
+            else:
+                removed_count = remove_classified_rows_by_keys(selected_result_keys)
+                st.session_state.last_message = f"已移除 {removed_count} 筆已分類卡片。"
+                save_progress_to_disk("auto"); st.rerun()
+    else:
+        st.info("目前沒有已分類卡片結果。")
     with st.expander("raw data 預覽", expanded=False):
         preview = news_df.copy()
         preview["處理狀態"] = preview["原始列號"].apply(status_for)
         st.dataframe(preview, use_container_width=True, height=300)
+
+
+# Compact download panel at bottom
+st.divider()
+st.markdown("<div class='step-title'>Step 4｜下載結果</div>", unsafe_allow_html=True)
+st.markdown("<div class='step-caption'>未完成時下載暫存檔；全部處理完成後再下載完成版。</div>", unsafe_allow_html=True)
+output_type = st.selectbox(
+    "選擇要產生的檔案",
+    ["暫存檔（下次可續作，含待確認/失敗/未處理）", "完成版（處理完成後交付）"],
+    key="bottom_output_type_v1751",
+)
+
+if unfinished > 0:
+    st.caption(f"目前未完成：待確認 {len(st.session_state.pending_orders)}｜抓取失敗 {len(st.session_state.failed_orders)}｜手動補卡 {len(st.session_state.manual_orders)}｜未處理 {unprocessed_count}")
+else:
+    st.caption("目前所有原始列都已處理完成。")
+
+if output_type.startswith("暫存檔"):
+    if st.button("產生暫存檔", use_container_width=True, key="btn_build_temp_workbook_bottom_v1751"):
+        with st.spinner("正在產生暫存檔..."):
+            st.session_state.temp_workbook_bytes = workbook_bytes(setting_bytes, news_df, include_working_states=True)
+            st.session_state.download_status_message = "暫存檔已產生。"
+    if st.session_state.get("temp_workbook_bytes"):
+        st.download_button(
+            "下載暫存檔",
+            data=st.session_state.temp_workbook_bytes,
+            file_name="信用卡新聞月度結果表_暫存版.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="download_temp_workbook_bottom_v1751",
+        )
+else:
+    if unfinished > 0:
+        st.warning("仍有未完成項目，完成版暫不建議產生。請先處理待確認、抓取失敗、手動補卡與未處理新聞。")
+    if st.button("產生完成版", use_container_width=True, disabled=unfinished > 0, key="btn_build_final_workbook_bottom_v1751"):
+        with st.spinner("正在產生完成版..."):
+            st.session_state.final_workbook_bytes = workbook_bytes(setting_bytes, news_df, include_working_states=False)
+            st.session_state.download_status_message = "完成版已產生。"
+    if st.session_state.get("final_workbook_bytes"):
+        st.download_button(
+            "下載完成版",
+            data=st.session_state.final_workbook_bytes,
+            file_name="信用卡新聞月度聲量表_完成版.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            disabled=unfinished > 0,
+            key="download_final_workbook_bottom_v1751",
+        )
+
+if st.session_state.get("download_status_message"):
+    st.caption(st.session_state.download_status_message)
+
+# Auto save progress.
+save_progress_to_disk("end_of_run")
